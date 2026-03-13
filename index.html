@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="theme-color" content="#050D05">
 <title>EuroMatch Edge</title>
@@ -691,13 +692,69 @@ const CFG = {
 
 /* ── Cache ───────────────────────────────────────────────────── */
 const Cache = (() => {
-  let _data = null, _ts = 0;
+  const LS_KEY       = 'eme_cache_v1';
+  const SCHEMA_VER   = 1;
+  let _mem           = null; // runtime mirror for fast reads
+
+  function _load() {
+    if (_mem) return _mem;
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed?.schemaVersion !== SCHEMA_VER) return null;
+      _mem = parsed;
+      return _mem;
+    } catch (e) {
+      console.warn('[Cache] localStorage parse error, clearing.', e);
+      try { localStorage.removeItem(LS_KEY); } catch (_) {}
+      return null;
+    }
+  }
+
+  function _save(entry) {
+    _mem = entry;
+    try { localStorage.setItem(LS_KEY, JSON.stringify(entry)); }
+    catch (e) { console.warn('[Cache] localStorage write failed:', e); }
+  }
+
   return {
-    write(rows)  { _data = rows; _ts = Date.now(); },
-    read()       { if (!_data || Date.now() - _ts > CFG.CACHE_TTL_MS) return null; return _data; },
-    readStale()  { return _data; },
-    ttlRemaining() { return Math.max(0, CFG.CACHE_TTL_MS - (Date.now() - _ts)); },
-    clear()      { _data = null; _ts = 0; },
+    /** Persist a fresh dataset. source = 'supabase' | 'mock' etc. */
+    write(rows, source = 'unknown') {
+      _save({ rows, source, ts: Date.now(), schemaVersion: SCHEMA_VER });
+    },
+
+    /** Returns rows only if within TTL, otherwise null. */
+    read() {
+      const entry = _load();
+      if (!entry) return null;
+      if (Date.now() - entry.ts > CFG.CACHE_TTL_MS) return null;
+      return entry.rows;
+    },
+
+    /** Always returns the last known rows, regardless of TTL. */
+    readStale() {
+      const entry = _load();
+      return entry ? entry.rows : null;
+    },
+
+    /** Ms remaining in current TTL (0 if expired/empty). */
+    ttlRemaining() {
+      const entry = _load();
+      if (!entry) return 0;
+      return Math.max(0, CFG.CACHE_TTL_MS - (Date.now() - entry.ts));
+    },
+
+    /** Source of the cached data ('supabase', 'mock', …). */
+    lastSource() {
+      const entry = _load();
+      return entry ? entry.source : null;
+    },
+
+    clear() {
+      _mem = null;
+      try { localStorage.removeItem(LS_KEY); } catch (_) {}
+    },
   };
 })();
 
@@ -801,12 +858,12 @@ const DataLayer = {
       if (cached) { this._lastSource = 'cache'; return { rows: cached, source: 'cache' }; }
     }
     if (CFG.DATA_MODE === 'mock') {
-      const rows = Mapper.fromRows(MOCK_ROWS); Cache.write(rows); this._lastSource = 'mock';
+      const rows = Mapper.fromRows(MOCK_ROWS); Cache.write(rows, 'mock'); this._lastSource = 'mock';
       return { rows, source: 'mock' };
     }
     if (CFG.DATA_MODE === 'supabase' || CFG.DATA_MODE === 'auto') {
       try {
-        const rows = await this._fetchSupabase(); Cache.write(rows); this._lastSource = 'supabase';
+        const rows = await this._fetchSupabase(); Cache.write(rows, 'supabase'); this._lastSource = 'supabase';
         return { rows, source: 'supabase' };
       } catch (err) {
         console.warn('[DataLayer] Supabase fetch failed:', err.message);
@@ -817,17 +874,24 @@ const DataLayer = {
         }
         const stale = Cache.readStale();
         if (stale) return { rows: stale, source: 'stale' };
-        const rows = Mapper.fromRows(MOCK_ROWS); Cache.write(rows); this._lastSource = 'mock';
+        const rows = Mapper.fromRows(MOCK_ROWS); Cache.write(rows, 'mock'); this._lastSource = 'mock';
         return { rows, source: 'mock' };
       }
     }
-    const rows = Mapper.fromRows(MOCK_ROWS); Cache.write(rows);
+    const rows = Mapper.fromRows(MOCK_ROWS); Cache.write(rows, 'mock');
     return { rows, source: 'mock' };
   },
   async _fetchSupabase() {
-    const now = new Date(), tomorrow = new Date(now.getTime() + 2 * 86_400_000);
-    const from = now.toISOString().replace(/\.\d+Z$/, '+00:00');
-    const to   = tomorrow.toISOString().replace(/\.\d+Z$/, '+00:00');
+    // Sauberes Tagesfenster: 00:00 heute bis 00:00 übermorgen (lokal)
+    const now      = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    const dayAfterTomorrow = new Date(todayStart.getTime() + 2 * 86_400_000);
+
+    // ISO ohne Millisekunden, mit +00:00 suffix für Supabase
+    const toISO = d => d.toISOString().replace(/\.\d+Z$/, '+00:00');
+    const from  = toISO(todayStart);
+    const to    = toISO(dayAfterTomorrow);
+
     const params = new URLSearchParams([
       ['kickoff_at', `gte.${from}`], ['kickoff_at', `lt.${to}`],
       ['order', 'kickoff_at.asc'],   ['select', '*'],
@@ -1136,13 +1200,38 @@ const App = {
     document.getElementById('header-date').textContent =
       new Date().toLocaleDateString('de-DE', { weekday:'short', day:'numeric', month:'long' });
 
-    document.getElementById('search-input').addEventListener('input', e => {
-      State.searchQuery = e.target.value.trim(); this._applyFilters();
+    // ── Restore persisted UI state ────────────────────────────
+    const savedTheme  = localStorage.getItem('eme_theme')  || 'dark';
+    const savedFilter = localStorage.getItem('eme_filter') || 'ALL';
+    const savedSearch = localStorage.getItem('eme_search') || '';
+
+    // Theme
+    let dark = savedTheme === 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+    document.getElementById('ico-sun').classList.toggle('hidden', !dark);
+    document.getElementById('ico-moon').classList.toggle('hidden', dark);
+
+    // Filter + Search into State
+    State.activeFilter = savedFilter;
+    State.searchQuery  = savedSearch;
+
+    // Prefill search input if there's a saved query
+    const searchInput = document.getElementById('search-input');
+    if (savedSearch) {
+      searchInput.value = savedSearch;
+      // Also expand the search bar on mobile so the filled value is visible
+      document.getElementById('header-search').classList.add('expanded');
+    }
+
+    // ── Search input ──────────────────────────────────────────
+    searchInput.addEventListener('input', e => {
+      State.searchQuery = e.target.value.trim();
+      localStorage.setItem('eme_search', State.searchQuery);
+      this._applyFilters();
     });
 
     // Expandable search on mobile
     const searchWrap = document.getElementById('header-search');
-    const searchInput = document.getElementById('search-input');
     const searchIcon  = document.getElementById('search-icon');
     searchIcon.addEventListener('click', () => {
       if (!searchWrap.classList.contains('expanded')) {
@@ -1160,17 +1249,22 @@ const App = {
         Drawer.close();
         searchInput.value = '';
         searchWrap.classList.remove('expanded');
-        State.searchQuery = ''; this._applyFilters();
+        State.searchQuery = '';
+        localStorage.setItem('eme_search', '');
+        this._applyFilters();
       }
     });
 
-    let dark = true;
+    // ── Theme toggle ──────────────────────────────────────────
     document.getElementById('btn-theme').onclick = () => {
       dark = !dark;
-      document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+      const theme = dark ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', theme);
       document.getElementById('ico-sun').classList.toggle('hidden', !dark);
       document.getElementById('ico-moon').classList.toggle('hidden', dark);
+      localStorage.setItem('eme_theme', theme);
     };
+
     window.addEventListener('scroll', () => {
       document.getElementById('scroll-top').classList.toggle('show', window.scrollY > 260);
     });
@@ -1201,7 +1295,12 @@ const App = {
     }
   },
 
-  setFilter(code) { State.activeFilter = code; Render.filters(State.allMatches); this._applyFilters(); },
+  setFilter(code) {
+    State.activeFilter = code;
+    localStorage.setItem('eme_filter', code);
+    Render.filters(State.allMatches);
+    this._applyFilters();
+  },
   _applyFilters() { Render.matches(State.filtered()); },
 };
 
