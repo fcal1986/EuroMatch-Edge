@@ -136,6 +136,12 @@ def map_match(raw: dict[str, Any], source_code: str) -> dict[str, Any] | None:
         log.warning("  Skipping match %s — missing team name(s).", match_id)
         return None
 
+    # Stable numeric team IDs from football-data.org.
+    # Stored as text (source-prefixed) to stay source-agnostic in the schema.
+    # enrich_matches.py uses these directly — no name matching needed.
+    home_source_id = home_team_raw.get("id")
+    away_source_id = away_team_raw.get("id")
+
     comp = COMPETITION_BY_SOURCE[source_code]   # always present: we only iterate active codes
 
     return {
@@ -157,8 +163,13 @@ def map_match(raw: dict[str, Any], source_code: str) -> dict[str, Any] | None:
         "home_team":             home_name,
         "away_team":             away_name,
 
+        # ── Stable source IDs — used by enrich_matches.py
+        # Stored as integer matching the DB column type (integer, nullable).
+        "home_team_source_id":   int(home_source_id) if home_source_id is not None else None,
+        "away_team_source_id":   int(away_source_id) if away_source_id is not None else None,
+
         # ── Modell-Eingangsdaten: MVP defaults
-        # Enriched later by compute_predictions.py or a dedicated enrichment job.
+        # Enriched later by enrich_matches.py before compute_predictions.py runs.
         "form_home":             [],
         "form_away":             [],
         "home_strength":         None,
