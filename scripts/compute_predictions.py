@@ -109,27 +109,55 @@ class SupabaseClient:
     def fetch_upcoming_matches(self, date_from: str, date_to: str) -> list[dict[str, Any]]:
         """
         Return matches with kickoff_at >= date_from and kickoff_at < date_to (exclusive upper bound).
-        Both values are ISO 8601 strings with UTC timezone.
-        """
-        # Supabase REST supports multiple filters for the same column as separate query params.
-        # lt. (strictly less than) gives an exclusive upper bound, matching half-open interval [from, to).
-        full_url = (
-            f"{self.base_url}/rest/v1/matches"
-            f"?kickoff_at=gte.{date_from}"
-            f"&kickoff_at=lt.{date_to}"
-            f"&order=kickoff_at.asc"
-            f"&select=*"
-        )
+        Both values are ISO 8601 strings with UTC timezone, microseconds stripped.
 
-        log.info("  Fetching matches: %s → %s", date_from, date_to)
+        Uses requests params= dict so that special characters ('+', ':') in timestamps
+        are percent-encoded correctly — avoids HTTP 400 from malformed query strings.
+        Supabase REST allows duplicate param keys for multi-filter on the same column.
+        """
+        url = f"{self.base_url}/rest/v1/matches"
+
+        # Strip microseconds for cleaner URLs: "2025-06-10T06:30:00+00:00" not "...123456+00:00"
+        def _clean_ts(ts: str) -> str:
+            try:
+                dt = datetime.fromisoformat(ts)
+                return dt.replace(microsecond=0).isoformat()
+            except ValueError:
+                return ts
+
+        ts_from = _clean_ts(date_from)
+        ts_to   = _clean_ts(date_to)
+
+        # requests encodes params= automatically — no manual URL building needed.
+        # To pass two filters for the same key, use a list of (key, value) tuples.
+        params = [
+            ("kickoff_at", f"gte.{ts_from}"),
+            ("kickoff_at", f"lt.{ts_to}"),
+            ("order",      "kickoff_at.asc"),
+            ("select",     "*"),
+        ]
+
+        log.info("  Fetching matches: %s → %s", ts_from, ts_to)
+
         response = requests.get(
-            full_url,
+            url,
+            params=params,
             headers={**self._auth_headers, "Range": "0-999"},
             timeout=20,
         )
-        response.raise_for_status()
+
+        if not response.ok:
+            log.error(
+                "  Supabase fetch failed: %d %s\n  URL : %s\n  Body: %s",
+                response.status_code,
+                response.reason,
+                response.url,
+                response.text[:500],
+            )
+            response.raise_for_status()
+
         rows = response.json()
-        log.info("  → %d match(es) found.", len(rows))
+        log.info("  → %d match(es) found.  (url: %s)", len(rows), response.url)
         return rows
 
     # ── WRITE ─────────────────────────────────────────────────
