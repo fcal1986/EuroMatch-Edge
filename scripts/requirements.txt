@@ -1,0 +1,4 @@
+# EuroMatch Edge — pipeline dependencies
+# Kept minimal: only what fetch_matches.py and compute_predictions.py actually import.
+
+requests==2.32.3
