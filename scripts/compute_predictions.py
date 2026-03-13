@@ -163,7 +163,14 @@ class SupabaseClient:
     # ── WRITE ─────────────────────────────────────────────────
 
     def upsert_predictions(self, rows: list[dict[str, Any]]) -> None:
-        """UPSERT prediction rows. Conflict key: match_id (UNIQUE in schema)."""
+        """
+        UPSERT prediction rows on conflict key `match_id`.
+
+        PostgREST requires two things for a true upsert:
+          1. ?on_conflict=match_id  — tells PostgREST which column to conflict on
+          2. Prefer: resolution=merge-duplicates — tells it to UPDATE, not error
+        Without (1), PostgREST falls back to INSERT and raises 409 on duplicates.
+        """
         if not rows:
             return
 
@@ -174,6 +181,7 @@ class SupabaseClient:
         }
         response = requests.post(
             url,
+            params={"on_conflict": "match_id"},
             headers=headers,
             data=json.dumps(rows),
             timeout=30,
@@ -181,10 +189,11 @@ class SupabaseClient:
 
         if not response.ok:
             log.error(
-                "  Supabase upsert failed: %d %s\n  Body: %s",
+                "  Supabase upsert failed: %d %s\n  URL : %s\n  Body: %s",
                 response.status_code,
                 response.reason,
-                response.text[:400],
+                response.url,
+                response.text[:500],
             )
             response.raise_for_status()
 
