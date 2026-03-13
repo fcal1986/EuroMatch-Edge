@@ -195,24 +195,36 @@ class SupabaseClient:
             "apikey":        service_role_key,
             "Authorization": f"Bearer {service_role_key}",
             "Content-Type":  "application/json",
-            # merge-duplicates = UPSERT on the table's UNIQUE constraint (external_id)
             "Prefer":        "resolution=merge-duplicates,return=minimal",
         })
 
     def upsert(self, table: str, rows: list[dict[str, Any]]) -> None:
-        """UPSERT rows into the given table. Raises on HTTP errors."""
+        """
+        UPSERT rows into the given table on conflict key `external_id`.
+
+        PostgREST requires two things for a true upsert:
+          1. ?on_conflict=external_id — tells PostgREST which column to conflict on
+          2. Prefer: resolution=merge-duplicates — tells it to UPDATE, not error
+        Without (1), PostgREST falls back to INSERT and raises 409 on duplicates.
+        """
         if not rows:
             return
 
         url      = f"{self.base_url}/rest/v1/{table}"
-        response = self.session.post(url, data=json.dumps(rows), timeout=30)
+        response = self.session.post(
+            url,
+            params={"on_conflict": "external_id"},
+            data=json.dumps(rows),
+            timeout=30,
+        )
 
         if not response.ok:
             log.error(
-                "  Supabase upsert failed: %d %s\n  Body: %s",
+                "  Supabase upsert failed: %d %s\n  URL : %s\n  Body: %s",
                 response.status_code,
                 response.reason,
-                response.text[:400],
+                response.url,
+                response.text[:500],
             )
             response.raise_for_status()
 
