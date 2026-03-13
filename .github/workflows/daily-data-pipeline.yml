@@ -91,7 +91,18 @@ jobs:
           echo "── fetch_matches.py ${{ steps.params.outputs.fetch_flags }}"
           python fetch_matches.py ${{ steps.params.outputs.fetch_flags }}
 
-      # ── 6. Compute predictions → Supabase
+      # ── 6. Enrich matches with strength + form data → Supabase
+      - name: Enrich matches
+        working-directory: scripts
+        env:
+          FOOTBALL_DATA_API_KEY:     ${{ secrets.FOOTBALL_DATA_API_KEY }}
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          echo "── enrich_matches.py ${{ steps.params.outputs.compute_flags }}"
+          python enrich_matches.py ${{ steps.params.outputs.compute_flags }}
+
+      # ── 7. Compute predictions → Supabase
       - name: Compute predictions
         working-directory: scripts
         env:
@@ -101,7 +112,7 @@ jobs:
           echo "── compute_predictions.py ${{ steps.params.outputs.compute_flags }}"
           python compute_predictions.py ${{ steps.params.outputs.compute_flags }}
 
-      # ── 7. Summary (always runs, even on failure)
+      # ── 8. Summary (always runs, even on failure)
       - name: Pipeline summary
         if: always()
         run: |
