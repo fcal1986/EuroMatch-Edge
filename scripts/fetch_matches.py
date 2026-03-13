@@ -285,11 +285,13 @@ def run(date_from: str, date_to: str, dry_run: bool) -> None:
     fd_client = FootballDataClient(api_key)
     sb_client = SupabaseClient(supabase_url, service_key) if not dry_run else None
 
-    total_fetched  = 0
-    total_mapped   = 0
-    total_skipped  = 0
-    total_upserted = 0
-    errors: list[str] = []
+    total_fetched    = 0
+    total_mapped     = 0
+    total_skipped    = 0
+    total_upserted   = 0
+    succeeded_codes: list[str] = []
+    failed_codes:    list[str] = []
+    errors:          list[str] = []
 
     for source_code in ACTIVE_SOURCE_CODES:
         log.info("─── %s", source_code)
@@ -298,15 +300,18 @@ def run(date_from: str, date_to: str, dry_run: bool) -> None:
         try:
             raw_matches = fd_client.get_matches(source_code, date_from, date_to)
         except requests.HTTPError as exc:
-            err = f"{source_code}: HTTP error — {exc}"
-            log.error("  %s", err)
+            status = exc.response.status_code if exc.response is not None else "?"
+            err = f"{source_code}: HTTP {status} — skipping"
+            log.warning("  %s", err)
             errors.append(err)
+            failed_codes.append(source_code)
             time.sleep(REQUEST_DELAY_SECONDS)
             continue
         except requests.RequestException as exc:
             err = f"{source_code}: Network error — {exc}"
-            log.error("  %s", err)
+            log.warning("  %s", err)
             errors.append(err)
+            failed_codes.append(source_code)
             time.sleep(REQUEST_DELAY_SECONDS)
             continue
 
@@ -327,22 +332,31 @@ def run(date_from: str, date_to: str, dry_run: bool) -> None:
             log.info("  [DRY RUN] Would upsert %d row(s).", len(rows))
             if rows:
                 log.info("  Sample row:\n%s", json.dumps(rows[0], indent=2, ensure_ascii=False))
+            succeeded_codes.append(source_code)
         elif rows:
             try:
                 sb_client.upsert(SUPABASE_TABLE, rows)
                 total_upserted += len(rows)
                 log.info("  ✓ Upserted %d row(s).", len(rows))
+                succeeded_codes.append(source_code)
             except requests.HTTPError as exc:
                 err = f"{source_code}: Supabase upsert failed — {exc}"
                 log.error("  %s", err)
                 errors.append(err)
+                failed_codes.append(source_code)
+        else:
+            # No matches found is not an error — competition simply has no games today
+            log.info("  No matches in window.")
+            succeeded_codes.append(source_code)
 
         time.sleep(REQUEST_DELAY_SECONDS)
 
     # ── Summary
     log.info("═══════════════════════════════════════════════")
     log.info("SUMMARY")
-    log.info("  Competitions : %d", len(ACTIVE_SOURCE_CODES))
+    log.info("  Competitions : %d active", len(ACTIVE_SOURCE_CODES))
+    log.info("  Succeeded    : %d  %s", len(succeeded_codes), succeeded_codes)
+    log.info("  Failed       : %d  %s", len(failed_codes),   failed_codes)
     log.info("  Fetched      : %d", total_fetched)
     log.info("  Mapped       : %d", total_mapped)
     log.info("  Skipped      : %d", total_skipped)
@@ -352,10 +366,17 @@ def run(date_from: str, date_to: str, dry_run: bool) -> None:
         log.warning("  Errors (%d):", len(errors))
         for err in errors:
             log.warning("    - %s", err)
+
+    # Exit 1 only when every competition failed — partial success is still success.
+    if len(succeeded_codes) == 0:
+        log.error("  No competitions succeeded — marking pipeline as failed.")
         log.info("═══════════════════════════════════════════════")
         sys.exit(1)
 
-    log.info("  Status       : SUCCESS")
+    if failed_codes:
+        log.warning("  Status : PARTIAL SUCCESS (%d competition(s) failed, pipeline continues)", len(failed_codes))
+    else:
+        log.info("  Status : SUCCESS")
     log.info("═══════════════════════════════════════════════")
 
 

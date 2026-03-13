@@ -95,6 +95,7 @@ COMPETITIONS: list[CompetitionConfig] = [
         competition_type="league",
         country="Türkei",
         flag="🇹🇷",
+        active=False,   # HTTP 403 on football-data.org free tier — re-enable when available
     ),
     CompetitionConfig(
         source_code="ELC",
@@ -122,6 +123,7 @@ COMPETITIONS: list[CompetitionConfig] = [
         competition_type="international",
         country="Europa",
         flag="🌍",
+        active=False,   # HTTP 403 on football-data.org free tier — re-enable when available
     ),
     # ── Inactive / future competitions ───────────────────────
     # Uncomment or set active=True to enable.
