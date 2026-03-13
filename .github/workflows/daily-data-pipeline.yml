@@ -1,6 +1,6 @@
 name: Daily Data Pipeline
 
-on:
+"on":
   # ── Manual trigger (for testing and ad-hoc runs)
   workflow_dispatch:
     inputs:
