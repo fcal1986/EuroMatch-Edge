@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
-<meta name="theme-color" content="#080B0F">
+<meta name="theme-color" content="#050D05">
 <title>EuroMatch Edge</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800;900&family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -40,20 +40,20 @@
 }
 
 [data-theme="dark"] {
-  --bg-0: #080B0F;
-  --bg-1: #0E1217;
-  --bg-2: #141920;
-  --bg-3: #1A2029;
-  --bg-4: #222A35;
-  --bg-glass: rgba(14,18,23,0.88);
-  --t-primary:   #F0F3F8;
-  --t-secondary: #8B96A8;
-  --t-muted:     #465060;
-  --t-invert:    #080B0F;
-  --border:      rgba(255,255,255,0.07);
-  --border-md:   rgba(255,255,255,0.12);
-  --shadow-card: 0 2px 12px rgba(0,0,0,0.45);
-  --shadow-lg:   0 8px 40px rgba(0,0,0,0.6);
+  --bg-0: #050D05;
+  --bg-1: #0A150A;
+  --bg-2: #0F1F0F;
+  --bg-3: #152615;
+  --bg-4: #1C301C;
+  --bg-glass: rgba(5,13,5,0.90);
+  --t-primary:   #E8F5E8;
+  --t-secondary: #7A9A7A;
+  --t-muted:     #3D5A3D;
+  --t-invert:    #050D05;
+  --border:      rgba(198,241,53,0.08);
+  --border-md:   rgba(198,241,53,0.15);
+  --shadow-card: 0 2px 12px rgba(0,0,0,0.55);
+  --shadow-lg:   0 8px 40px rgba(0,0,0,0.7);
 }
 
 [data-theme="light"] {
@@ -130,11 +130,15 @@ a { color: inherit; text-decoration: none; }
 }
 @media (min-width: 600px) { .header-date { display: block; } }
 
-.header-search { flex: 1; min-width: 0; position: relative; }
+.header-search {
+  flex: 1; min-width: 0; position: relative;
+  /* expandable: collapsed by default on mobile */
+}
 .header-search svg {
   position: absolute; left: 11px; top: 50%;
   transform: translateY(-50%);
   color: var(--t-muted); pointer-events: none;
+  transition: color .15s;
 }
 .header-search input {
   width: 100%; height: 36px;
@@ -143,10 +147,33 @@ a { color: inherit; text-decoration: none; }
   font-size: 13px; font-weight: 400;
   padding: 0 12px 0 34px;
   border-radius: var(--r-pill);
-  outline: none; transition: border-color .15s;
+  outline: none; transition: border-color .15s, max-width .3s cubic-bezier(.4,0,.2,1), opacity .25s;
 }
 .header-search input:focus { border-color: var(--lime); }
 .header-search input::placeholder { color: var(--t-muted); }
+
+/* Mobile: icon-only, expands on focus */
+@media (max-width: 599px) {
+  .header-search {
+    position: relative;
+    flex: 0 0 36px;
+    transition: flex-basis .3s cubic-bezier(.4,0,.2,1);
+  }
+  .header-search.expanded { flex: 1; }
+  .header-search input {
+    padding-left: 36px;
+    max-width: 36px; width: 36px;
+    opacity: 0; pointer-events: none;
+    border-color: transparent; background: transparent;
+  }
+  .header-search.expanded input {
+    max-width: 100%; width: 100%;
+    opacity: 1; pointer-events: all;
+    background: var(--bg-3); border-color: var(--border);
+  }
+  .header-search svg { pointer-events: auto; cursor: pointer; z-index: 1; }
+  .header-search.expanded svg { color: var(--lime); pointer-events: none; }
+}
 
 .header-actions { display: flex; gap: 8px; flex-shrink: 0; }
 
@@ -479,6 +506,14 @@ a { color: inherit; text-decoration: none; }
 .rtag-d { font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 99px; background: var(--red-dim); color: var(--red); border: 1px solid rgba(255,59,85,.2); }
 .rtag-ok { font-size: 13px; color: var(--green); }
 
+/* ══ green theme refinements ══ */
+[data-theme="dark"] .kpi          { box-shadow: inset 0 1px 0 rgba(198,241,53,0.05); }
+[data-theme="dark"] .match-row:hover { background: var(--bg-2); }
+[data-theme="dark"] .top-card::before {
+  background: linear-gradient(135deg, rgba(198,241,53,0.10) 0%, transparent 60%);
+}
+[data-theme="dark"] .filter-panel { box-shadow: inset 0 -1px 0 rgba(198,241,53,0.05); }
+
 /* ══════════════════════════════════════════════════════════════
    FOOTER / SCROLL TOP / UTILS
 ══════════════════════════════════════════════════════════════ */
@@ -514,8 +549,8 @@ footer { border-top: 1px solid var(--border); padding: 14px var(--sp-md); font-s
       <div class="logo-name">Euro<span>Match</span> Edge</div>
     </div>
     <div class="header-date" id="header-date">–</div>
-    <div class="header-search">
-      <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+    <div class="header-search" id="header-search">
+      <svg id="search-icon" width="14" height="14" viewBox="0 0 14 14" fill="none">
         <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.4"/>
         <path d="M9.5 9.5L12.5 12.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
       </svg>
@@ -1104,7 +1139,30 @@ const App = {
     document.getElementById('search-input').addEventListener('input', e => {
       State.searchQuery = e.target.value.trim(); this._applyFilters();
     });
-    document.addEventListener('keydown', e => { if (e.key === 'Escape') Drawer.close(); });
+
+    // Expandable search on mobile
+    const searchWrap = document.getElementById('header-search');
+    const searchInput = document.getElementById('search-input');
+    const searchIcon  = document.getElementById('search-icon');
+    searchIcon.addEventListener('click', () => {
+      if (!searchWrap.classList.contains('expanded')) {
+        searchWrap.classList.add('expanded');
+        setTimeout(() => searchInput.focus(), 50);
+      }
+    });
+    searchInput.addEventListener('blur', () => {
+      if (!searchInput.value) {
+        searchWrap.classList.remove('expanded');
+      }
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        Drawer.close();
+        searchInput.value = '';
+        searchWrap.classList.remove('expanded');
+        State.searchQuery = ''; this._applyFilters();
+      }
+    });
 
     let dark = true;
     document.getElementById('btn-theme').onclick = () => {
