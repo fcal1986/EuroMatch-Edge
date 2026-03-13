@@ -1,7 +1,7 @@
 name: Daily Data Pipeline
 
-"on":
-  # ── Manual trigger (for testing and ad-hoc runs)
+on:
+  # ── Manual trigger (for testing)
   workflow_dispatch:
     inputs:
       date_from:
@@ -18,22 +18,23 @@ name: Daily Data Pipeline
         type: boolean
         default: false
 
-  # ── Scheduled trigger: daily at 06:00 UTC
+  # ── Automatic run every day at 06:00 UTC
   schedule:
     - cron: "0 6 * * *"
 
 jobs:
   pipeline:
-    name: Fetch & Compute
+    name: Fetch → Enrich → Compute
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      # ── 1. Checkout
+
+      # ── 1. Checkout repo
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Python setup
+      # ── 2. Setup Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -45,9 +46,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r scripts/requirements.txt
 
-      # ── 4. Resolve date range
-      # For scheduled runs: date_from and date_to are empty → scripts use their own defaults.
-      # For manual runs: pass through whatever the user entered (or leave empty for defaults).
+      # ── 4. Resolve parameters
       - name: Resolve run parameters
         id: params
         run: |
@@ -55,32 +54,26 @@ jobs:
           DATE_TO="${{ github.event.inputs.date_to }}"
           DRY_RUN="${{ github.event.inputs.dry_run }}"
 
-          # Build optional CLI flags
           FETCH_FLAGS=""
           COMPUTE_FLAGS=""
 
           if [ -n "$DATE_FROM" ]; then
             FETCH_FLAGS="$FETCH_FLAGS --date-from $DATE_FROM"
           fi
+
           if [ -n "$DATE_TO" ]; then
             FETCH_FLAGS="$FETCH_FLAGS --date-to $DATE_TO"
           fi
+
           if [ "$DRY_RUN" = "true" ]; then
             FETCH_FLAGS="$FETCH_FLAGS --dry-run"
             COMPUTE_FLAGS="$COMPUTE_FLAGS --dry-run"
           fi
 
-          echo "fetch_flags=$FETCH_FLAGS"   >> "$GITHUB_OUTPUT"
+          echo "fetch_flags=$FETCH_FLAGS" >> "$GITHUB_OUTPUT"
           echo "compute_flags=$COMPUTE_FLAGS" >> "$GITHUB_OUTPUT"
 
-          echo "── Run parameters ──────────────────────"
-          echo "  date_from  : ${DATE_FROM:-<default>}"
-          echo "  date_to    : ${DATE_TO:-<default>}"
-          echo "  dry_run    : ${DRY_RUN:-false}"
-          echo "  fetch_flags: $FETCH_FLAGS"
-          echo "  compute_flags: $COMPUTE_FLAGS"
-
-      # ── 5. Fetch matches from football-data.org → Supabase
+      # ── 5. Fetch matches
       - name: Fetch matches
         working-directory: scripts
         env:
@@ -91,7 +84,7 @@ jobs:
           echo "── fetch_matches.py ${{ steps.params.outputs.fetch_flags }}"
           python fetch_matches.py ${{ steps.params.outputs.fetch_flags }}
 
-      # ── 6. Enrich matches with strength + form data → Supabase
+      # ── 6. Enrich matches
       - name: Enrich matches
         working-directory: scripts
         env:
@@ -99,10 +92,10 @@ jobs:
           SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          echo "── enrich_matches.py ${{ steps.params.outputs.compute_flags }}"
-          python enrich_matches.py ${{ steps.params.outputs.compute_flags }}
+          echo "── enrich_matches.py"
+          python enrich_matches.py
 
-      # ── 7. Compute predictions → Supabase
+      # ── 7. Compute predictions
       - name: Compute predictions
         working-directory: scripts
         env:
@@ -112,7 +105,7 @@ jobs:
           echo "── compute_predictions.py ${{ steps.params.outputs.compute_flags }}"
           python compute_predictions.py ${{ steps.params.outputs.compute_flags }}
 
-      # ── 8. Summary (always runs, even on failure)
+      # ── 8. Summary
       - name: Pipeline summary
         if: always()
         run: |
