@@ -1,0 +1,89 @@
+name: Backtest Pipeline
+
+# ── Auslöser ─────────────────────────────────────────────────────
+"on":
+  # Täglich um 06:30 UTC — nach dem Daily Data Pipeline (06:00)
+  schedule:
+    - cron: "30 6 * * *"
+
+  # Manuell mit optionalen Parametern
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "Saison (z.B. 2024/25). Leer = alle Saisons."
+        required: false
+        default: ""
+      competition:
+        description: "Liga-Code (z.B. BL1, PL, CL). Leer = alle Ligen."
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry Run — berechnen ohne Supabase-Write"
+        type: boolean
+        default: false
+
+jobs:
+  backtest:
+    name: Modell-Backtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ── 1. Checkout
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python einrichten
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "scripts/requirements.txt"
+
+      # ── 3. Abhängigkeiten installieren
+      - name: Abhängigkeiten installieren
+        run: pip install -r scripts/requirements.txt
+
+      # ── 4. CLI-Flags zusammenbauen
+      - name: Parameter auflösen
+        id: params
+        run: |
+          FLAGS=""
+          if [ -n "${{ github.event.inputs.season }}" ]; then
+            FLAGS="$FLAGS --season ${{ github.event.inputs.season }}"
+          fi
+          if [ -n "${{ github.event.inputs.competition }}" ]; then
+            FLAGS="$FLAGS --competition ${{ github.event.inputs.competition }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            FLAGS="$FLAGS --dry-run"
+          fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+          echo "── Parameter ──────────────────────────"
+          echo "  season     : ${{ github.event.inputs.season }}"
+          echo "  competition: ${{ github.event.inputs.competition }}"
+          echo "  dry_run    : ${{ github.event.inputs.dry_run }}"
+          echo "  flags      : $FLAGS"
+
+      # ── 5. Backtest ausführen
+      - name: Backtest ausführen
+        working-directory: scripts
+        env:
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          echo "── backtest.py ${{ steps.params.outputs.flags }}"
+          python backtest.py ${{ steps.params.outputs.flags }}
+
+      # ── 6. Zusammenfassung
+      - name: Zusammenfassung
+        if: always()
+        run: |
+          echo "══════════════════════════════════════"
+          echo "Backtest abgeschlossen"
+          echo "  Trigger : ${{ github.event_name }}"
+          echo "  Run ID  : ${{ github.run_id }}"
+          echo "  Status  : ${{ job.status }}"
+          echo "  Zeit    : $(date -u)"
+          echo "══════════════════════════════════════"
