@@ -20,7 +20,7 @@ name: Daily Data Pipeline
 
   # ── Scheduled trigger: daily at 06:00 UTC
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 6-23 * * *"
 
 jobs:
   pipeline:
