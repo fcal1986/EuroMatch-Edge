@@ -57,10 +57,27 @@ const Drawer = {
     document.getElementById('drawer-overlay').classList.add('open');
     document.body.style.overflow = 'hidden';
 
-    let ty0 = 0;
-    const dr = document.getElementById('drawer');
-    dr.addEventListener('touchstart', e => { ty0 = e.touches[0].clientY; }, { passive: true, once: true });
-    dr.addEventListener('touchmove',  e => { if (e.touches[0].clientY - ty0 > 70) Drawer.close(); }, { passive: true, once: true });
+    // Swipe-Down auf Handle/Header schließt Drawer.
+    // Läuft nur auf dem nicht-scrollbaren Bereich (drawer-handle, drawer-head),
+    // damit Scroll im drawer-body nicht fälschlich das Schließen triggert.
+    const dr       = document.getElementById('drawer');
+    const drHandle = dr.querySelector('.drawer-handle');
+    const drHead   = dr.querySelector('.drawer-head');
+
+    const startSwipe = e => {
+      e._swipeStartY = e.touches[0].clientY;
+    };
+    const moveSwipe = e => {
+      const delta = e.touches[0].clientY - e._swipeStartY;
+      if (delta === undefined) return;
+      if (delta > 70) Drawer.close();
+    };
+
+    [drHandle, drHead].forEach(el => {
+      if (!el) return;
+      el.addEventListener('touchstart', startSwipe, { passive: true, once: true });
+      el.addEventListener('touchmove',  moveSwipe,  { passive: true, once: true });
+    });
   },
 
   close() {
