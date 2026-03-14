@@ -664,106 +664,131 @@ def run_backtest(
     log.info("  version     : %s", _sys_version)
     log.info("  run_id      : %s", _run_id)
 
-    matches = fetch_finished_matches(season=season, competition=competition)
-    log.info("Fetched %d finished matches", len(matches))
+    try:
+        matches = fetch_finished_matches(season=season, competition=competition)
+        log.info("Fetched %d finished matches", len(matches))
 
-    if not matches:
-        log.warning("No finished matches found — nothing to do.")
-        return
+        if not matches:
+            log.warning("No finished matches found — nothing to do.")
+            finish_pipeline_run(
+                _run_id,
+                status="success",
+                metadata={
+                    "rows_written": 0,
+                    "skipped": 0,
+                    "reason": "no_finished_matches",
+                    "dry_run": dry_run,
+                },
+            )
+            return
 
-    rows: list[dict] = []
-    skipped = 0
+        rows: list[dict] = []
+        skipped = 0
 
-    for m in matches:
-        actual_h = m.get("actual_home_goals")
-        actual_a = m.get("actual_away_goals")
-        if actual_h is None or actual_a is None:
-            skipped += 1
-            continue
-
-        actual_score  = f"{actual_h}:{actual_a}"
-        actual_winner = (
-            "home"  if actual_h > actual_a else
-            "away"  if actual_a > actual_h else
-            "draw"
-        )
-
-        for model_key, model_fn in MODELS.items():
-            try:
-                result = model_fn(m)
-            except Exception as exc:
-                log.warning("  [WARN] %s on %s failed: %s", model_key, m.get("id"), exc)
+        for m in matches:
+            actual_h = m.get("actual_home_goals")
+            actual_a = m.get("actual_away_goals")
+            if actual_h is None or actual_a is None:
+                skipped += 1
                 continue
 
-            pts     = calc_points(result["predicted_score"], actual_h, actual_a)
-            outcome = calc_outcome_label(result["predicted_score"], actual_h, actual_a)
-            rows.append({
-                "match_id":           m["id"],
-                "model_key":          model_key,
-                "model_version":      MODEL_VERSION,
-                "calibration_version": CALIBRATION_VERSION,
-                "weights_version":     WEIGHTS_VERSION,
-                # Prognose
-                "predicted_score":    result["predicted_score"],
-                "predicted_winner":   result["predicted_winner"],
-                "confidence_score":   result["confidence_score"],
-                # Ergebnis
-                "actual_score":       actual_score,
-                "actual_winner":      actual_winner,
-                "actual_home_goals":  actual_h,
-                "actual_away_goals":  actual_a,
-                # Bewertung
-                "points":             pts,
-                "outcome_label":      outcome,
-                # Spielkontext (denormalisiert für Frontend)
-                "home_team":          m.get("home_team", ""),
-                "away_team":          m.get("away_team", ""),
-                "flag":               m.get("flag", ""),
-                "league_abbr":        m.get("league_abbr", ""),
-                "competition_code":   m.get("competition_code", ""),
-                "season":             m.get("season", season or ""),
-                "kickoff_at":         m.get("kickoff_at"),
-                # Versioning — filled below after pipeline_run_id is known:
-                "system_version":  None,
-                "pipeline_run_id": None,
-            })
+            actual_score  = f"{actual_h}:{actual_a}"
+            actual_winner = (
+                "home"  if actual_h > actual_a else
+                "away"  if actual_a > actual_h else
+                "draw"
+            )
 
-    if skipped:
-        log.warning("Skipped %d matches with missing actual goals", skipped)
+            for model_key, model_fn in MODELS.items():
+                try:
+                    result = model_fn(m)
+                except Exception as exc:
+                    log.warning("  [WARN] %s on %s failed: %s", model_key, m.get("id"), exc)
+                    continue
 
-    log.info("Computed %d predictions (%d matches × %d models)",
-             len(rows), len(matches) - skipped, len(MODELS))
+                pts     = calc_points(result["predicted_score"], actual_h, actual_a)
+                outcome = calc_outcome_label(result["predicted_score"], actual_h, actual_a)
+                rows.append({
+                    "match_id":            m["id"],
+                    "model_key":           model_key,
+                    "model_version":       MODEL_VERSION,
+                    "calibration_version": CALIBRATION_VERSION,
+                    "weights_version":     WEIGHTS_VERSION,
+                    # Prognose
+                    "predicted_score":     result["predicted_score"],
+                    "predicted_winner":    result["predicted_winner"],
+                    "confidence_score":    result["confidence_score"],
+                    # Ergebnis
+                    "actual_score":        actual_score,
+                    "actual_winner":       actual_winner,
+                    "actual_home_goals":   actual_h,
+                    "actual_away_goals":   actual_a,
+                    # Bewertung
+                    "points":              pts,
+                    "outcome_label":       outcome,
+                    # Spielkontext (denormalisiert für Frontend)
+                    "home_team":           m.get("home_team", ""),
+                    "away_team":           m.get("away_team", ""),
+                    "flag":                m.get("flag", ""),
+                    "league_abbr":         m.get("league_abbr", ""),
+                    "competition_code":    m.get("competition_code", ""),
+                    "season":              m.get("season", season or ""),
+                    "kickoff_at":          m.get("kickoff_at"),
+                    # Versioning — filled below after pipeline_run_id is known:
+                    "system_version":      None,
+                    "pipeline_run_id":     None,
+                })
 
-    # Inject versioning metadata
-    for r in rows:
-        r["system_version"]  = _sys_version
-        r["pipeline_run_id"] = _run_id
+        if skipped:
+            log.warning("Skipped %d matches with missing actual goals", skipped)
 
-    if dry_run:
-        log.info("DRY RUN — no Supabase write")
-        # Print first 3 rows for inspection
-        sample = rows[:3]
-        print(json.dumps(sample, indent=2, default=str))
-        # Print per-model summary
-        from collections import defaultdict
-        by_model: dict = defaultdict(list)
+        log.info(
+            "Computed %d predictions (%d matches × %d models)",
+            len(rows),
+            len(matches) - skipped,
+            len(MODELS),
+        )
+
         for r in rows:
-            by_model[r["model_key"]].append(r["points"])
-        print("\nPoints summary (dry run):")
-        for mk, pts_list in sorted(by_model.items()):
-            n     = len(pts_list)
-            avg   = sum(pts_list) / n if n else 0
-            exact = sum(1 for p in pts_list if p == 4)
-            print(f"  {mk:12s}  n={n:4d}  avg={avg:.2f}  exact={exact}")
-    else:
-        upsert_results(rows)
+            r["system_version"]  = _sys_version
+            r["pipeline_run_id"] = _run_id
 
-    log.info("── Backtest done ───────────────────────────────────")
-    finish_pipeline_run(
-        _run_id,
-        status="success" if not dry_run else "dry_run",
-        metadata={"rows_written": len(rows), "skipped": skipped},
-    )
+        if dry_run:
+            log.info("DRY RUN — no Supabase write")
+            sample = rows[:3]
+            print(json.dumps(sample, indent=2, default=str))
+            from collections import defaultdict
+            by_model: dict = defaultdict(list)
+            for r in rows:
+                by_model[r["model_key"]].append(r["points"])
+            print("\nPoints summary (dry run):")
+            for mk, pts_list in sorted(by_model.items()):
+                n     = len(pts_list)
+                avg   = sum(pts_list) / n if n else 0
+                exact = sum(1 for p in pts_list if p == 4)
+                print(f"  {mk:12s}  n={n:4d}  avg={avg:.2f}  exact={exact}")
+        else:
+            upsert_results(rows)
+
+        log.info("── Backtest done ───────────────────────────────────")
+        finish_pipeline_run(
+            _run_id,
+            status="success" if not dry_run else "dry_run",
+            metadata={"rows_written": len(rows), "skipped": skipped, "dry_run": dry_run},
+        )
+    except Exception as exc:
+        finish_pipeline_run(
+            _run_id,
+            status="failed",
+            metadata={
+                "error": str(exc),
+                "season": season,
+                "competition": competition,
+                "dry_run": dry_run,
+            },
+        )
+        log.error("Backtest failed: %s", exc)
+        raise
 
 
 if __name__ == "__main__":

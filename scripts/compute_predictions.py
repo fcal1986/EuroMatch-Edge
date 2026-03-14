@@ -62,9 +62,9 @@ log = logging.getLogger(__name__)
 # MODEL CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-MODEL_VERSION        = "1.0"
-CALIBRATION_VERSION  = "1.0"   # bump when calibration is retrained
-WEIGHTS_VERSION      = "1.0"   # bump when WEIGHTS dict changes
+MODEL_VERSION       = os.environ.get("MODEL_VERSION", "1.0")
+CALIBRATION_VERSION = os.environ.get("CALIBRATION_VERSION", "1.0")  # bump when calibration is retrained
+WEIGHTS_VERSION     = os.environ.get("WEIGHTS_VERSION", "1.0")      # bump when WEIGHTS dict changes
 
 # Minimum win_probability to be flagged as a strong tip
 STRONG_TIP_THRESHOLD = 70
@@ -672,8 +672,9 @@ def load_env() -> tuple[str, str]:
         if not val
     ]
     if missing:
-        log.error("Missing required environment variables: %s", ", ".join(missing))
-        sys.exit(1)
+        raise RuntimeError(
+            f"Missing required environment variables: {', '.join(missing)}"
+        )
 
     return supabase_url, service_key
 
@@ -683,7 +684,7 @@ def load_env() -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────
 
 def run(days_ahead: int, dry_run: bool) -> None:
-    now      = datetime.now(timezone.utc)
+    now       = datetime.now(timezone.utc)
     date_from = now.isoformat()
     date_to   = (now + timedelta(days=days_ahead)).isoformat()
 
@@ -696,7 +697,6 @@ def run(days_ahead: int, dry_run: bool) -> None:
     log.info("Model    : v%s", MODEL_VERSION)
     log.info("═══════════════════════════════════════════════")
 
-    # ── Metadata tracking ──────────────────────────────────
     _sys_version = get_system_version()
     _run_id      = start_pipeline_run(
         "compute_predictions",
@@ -707,116 +707,132 @@ def run(days_ahead: int, dry_run: bool) -> None:
     log.info("Version    : %s", _sys_version)
     log.info("Run ID     : %s", _run_id)
 
-    supabase_url, service_key = load_env()
-    sb = SupabaseClient(supabase_url, service_key)
-
-    # ── Fetch matches
     try:
-        matches = sb.fetch_upcoming_matches(date_from, date_to)
-    except requests.HTTPError as exc:
-        log.error("Failed to fetch matches from Supabase: %s", exc)
-        sys.exit(1)
-    except requests.RequestException as exc:
-        log.error("Network error fetching matches: %s", exc)
-        sys.exit(1)
+        supabase_url, service_key = load_env()
+        sb = SupabaseClient(supabase_url, service_key)
 
-    if not matches:
-        log.info("No upcoming matches found in window. Nothing to compute.")
-        log.info("Status: SUCCESS (no-op)")
-        return
-
-    # ── Compute predictions
-    now_utc = datetime.now(timezone.utc)
-    predictions:    list[dict[str, Any]] = []
-    compute_errors: list[str]            = []
-    skipped_past:   int                  = 0
-
-    for match in matches:
-        match_id  = match.get("id", "?")
-        home_team = match.get("home_team", "?")
-        away_team = match.get("away_team", "?")
-
-        # Guard: skip any match that has already kicked off.
-        # The Supabase query filters by kickoff_at >= now, but rows whose kickoff_at
-        # was in the future when fetched could slip through if the pipeline runs slowly,
-        # or if stale rows land in the table from a manual insert.
-        kickoff_raw = match.get("kickoff_at")
-        if kickoff_raw:
-            try:
-                kickoff_dt = datetime.fromisoformat(kickoff_raw.replace("Z", "+00:00"))
-                if kickoff_dt <= now_utc:
-                    log.warning(
-                        "  ⏭ Skipping past match: %s vs %s (kickoff %s)",
-                        home_team, away_team, kickoff_raw,
-                    )
-                    skipped_past += 1
-                    continue
-            except ValueError:
-                log.warning("  Could not parse kickoff_at '%s' for match %s — processing anyway.", kickoff_raw, match_id)
-
+        # ── Fetch matches
         try:
-            pred = compute_prediction(match)
-            predictions.append(pred)
-            log.info(
-                "  ✓ %s vs %s  →  home %d%%  draw %d%%  away %d%%  conf %d%%  %s",
-                home_team, away_team,
-                pred["win_probability"], pred["draw_probability"], pred["away_probability"],
-                pred["confidence_score"],
-                "⚡ STRONG" if pred["is_strong_tip"] else "",
-            )
-        except Exception as exc:          # noqa: BLE001 — catch-all so one bad match doesn't abort the run
-            err = f"match {match_id} ({home_team} vs {away_team}): {exc}"
-            log.error("  ✗ Failed to compute prediction — %s", err)
-            compute_errors.append(err)
-
-    log.info("─── Computed %d / %d prediction(s).", len(predictions), len(matches))
-
-    # ── Inject versioning metadata into all prediction rows
-    for p in predictions:
-        p["system_version"]  = _sys_version
-        p["pipeline_run_id"] = _run_id
-
-    # ── Upsert
-    if dry_run:
-        log.info("[DRY RUN] Would upsert %d row(s).", len(predictions))
-        if predictions:
-            log.info("Sample row:\n%s", json.dumps(predictions[0], indent=2, ensure_ascii=False))
-    elif predictions:
-        try:
-            sb.upsert_predictions(predictions)
-            log.info("✓ Upserted %d prediction(s).", len(predictions))
+            matches = sb.fetch_upcoming_matches(date_from, date_to)
         except requests.HTTPError as exc:
-            log.error("Supabase upsert failed: %s", exc)
-            sys.exit(1)
+            raise RuntimeError(f"Failed to fetch matches from Supabase: {exc}") from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Network error fetching matches: {exc}") from exc
 
-    # ── Summary
-    strong_tips = sum(1 for p in predictions if p["is_strong_tip"])
-    log.info("═══════════════════════════════════════════════")
-    log.info("SUMMARY")
-    log.info("  Matches fetched    : %d", len(matches))
-    log.info("  Skipped (past)     : %d", skipped_past)
-    log.info("  Predictions built  : %d", len(predictions))
-    log.info("  Strong tips (≥%d%%): %d", STRONG_TIP_THRESHOLD, strong_tips)
-    log.info("  Compute errors     : %d", len(compute_errors))
+        if not matches:
+            log.info("No upcoming matches found in window. Nothing to compute.")
+            log.info("Status: SUCCESS (no-op)")
+            finish_pipeline_run(
+                _run_id,
+                status="success",
+                metadata={"predictions": 0, "errors": 0, "reason": "no_upcoming_matches"},
+            )
+            return
 
-    if compute_errors:
-        log.warning("  Failed matches:")
-        for err in compute_errors:
-            log.warning("    - %s", err)
+        # ── Compute predictions
+        now_utc = datetime.now(timezone.utc)
+        predictions:    list[dict[str, Any]] = []
+        compute_errors: list[str]            = []
+        skipped_past:   int                  = 0
 
-    if compute_errors and len(compute_errors) == len(matches):
-        log.error("  All predictions failed.")
+        for match in matches:
+            match_id  = match.get("id", "?")
+            home_team = match.get("home_team", "?")
+            away_team = match.get("away_team", "?")
+
+            # Guard: skip any match that has already kicked off.
+            # The Supabase query filters by kickoff_at >= now, but rows whose kickoff_at
+            # was in the future when fetched could slip through if the pipeline runs slowly,
+            # or if stale rows land in the table from a manual insert.
+            kickoff_raw = match.get("kickoff_at")
+            if kickoff_raw:
+                try:
+                    kickoff_dt = datetime.fromisoformat(kickoff_raw.replace("Z", "+00:00"))
+                    if kickoff_dt <= now_utc:
+                        log.warning(
+                            "  ⏭ Skipping past match: %s vs %s (kickoff %s)",
+                            home_team, away_team, kickoff_raw,
+                        )
+                        skipped_past += 1
+                        continue
+                except ValueError:
+                    log.warning(
+                        "  Could not parse kickoff_at '%s' for match %s — processing anyway.",
+                        kickoff_raw,
+                        match_id,
+                    )
+
+            try:
+                pred = compute_prediction(match)
+                predictions.append(pred)
+                log.info(
+                    "  ✓ %s vs %s  →  home %d%%  draw %d%%  away %d%%  conf %d%%  %s",
+                    home_team, away_team,
+                    pred["win_probability"], pred["draw_probability"], pred["away_probability"],
+                    pred["confidence_score"],
+                    "⚡ STRONG" if pred["is_strong_tip"] else "",
+                )
+            except Exception as exc:  # noqa: BLE001
+                err = f"match {match_id} ({home_team} vs {away_team}): {exc}"
+                log.error("  ✗ Failed to compute prediction — %s", err)
+                compute_errors.append(err)
+
+        log.info("─── Computed %d / %d prediction(s).", len(predictions), len(matches))
+
+        for p in predictions:
+            p["system_version"]  = _sys_version
+            p["pipeline_run_id"] = _run_id
+
+        if dry_run:
+            log.info("[DRY RUN] Would upsert %d row(s).", len(predictions))
+            if predictions:
+                log.info("Sample row:\n%s", json.dumps(predictions[0], indent=2, ensure_ascii=False))
+        elif predictions:
+            try:
+                sb.upsert_predictions(predictions)
+                log.info("✓ Upserted %d prediction(s).", len(predictions))
+            except requests.HTTPError as exc:
+                raise RuntimeError(f"Supabase upsert failed: {exc}") from exc
+
+        strong_tips = sum(1 for p in predictions if p["is_strong_tip"])
         log.info("═══════════════════════════════════════════════")
-        finish_pipeline_run(_run_id, status="failed",
-            metadata={"errors": compute_errors})
-        sys.exit(1)
+        log.info("SUMMARY")
+        log.info("  Matches fetched    : %d", len(matches))
+        log.info("  Skipped (past)     : %d", skipped_past)
+        log.info("  Predictions built  : %d", len(predictions))
+        log.info("  Strong tips (≥%d%%): %d", STRONG_TIP_THRESHOLD, strong_tips)
+        log.info("  Compute errors     : %d", len(compute_errors))
 
-    log.info("  Status             : SUCCESS")
-    log.info("  System version     : %s", _sys_version)
-    log.info("  Pipeline run ID    : %s", _run_id)
-    log.info("═══════════════════════════════════════════════")
-    finish_pipeline_run(_run_id, status="success",
-        metadata={"predictions": len(predictions), "errors": len(compute_errors)})
+        if compute_errors:
+            log.warning("  Failed matches:")
+            for err in compute_errors:
+                log.warning("    - %s", err)
+
+        if compute_errors and len(compute_errors) == len(matches):
+            raise RuntimeError(f"All predictions failed: {compute_errors}")
+
+        log.info("  Status             : SUCCESS")
+        log.info("  System version     : %s", _sys_version)
+        log.info("  Pipeline run ID    : %s", _run_id)
+        log.info("═══════════════════════════════════════════════")
+        finish_pipeline_run(
+            _run_id,
+            status="success",
+            metadata={
+                "predictions": len(predictions),
+                "errors": len(compute_errors),
+                "skipped_past": skipped_past,
+                "dry_run": dry_run,
+            },
+        )
+    except Exception as exc:
+        finish_pipeline_run(
+            _run_id,
+            status="failed",
+            metadata={"error": str(exc), "days_ahead": days_ahead, "dry_run": dry_run},
+        )
+        log.error("Pipeline failed: %s", exc)
+        sys.exit(1)
 
 
 def main() -> None:
