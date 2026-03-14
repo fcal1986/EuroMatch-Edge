@@ -1,46 +1,58 @@
 'use strict';
 
 /* ── Drawer ──────────────────────────────────────────────────────
-   Detail drawer / bottom sheet.
-   Sections:
+   Detail-Drawer / Bottom Sheet.
+   Vanilla JS — kein Framework, kein React.
+
+   Abschnitte:
      1. Siegwahrscheinlichkeit
      2. Teamstärke + Form
-     3. Kicktipp-Empfehlung (weighted consensus)
-     4. Modellvergleich (non-AI models, each with score distribution)
+     3. Kicktipp-Empfehlung (Weighted Consensus)
+     4. Modellvergleich (mit Score-Verteilung)
      5. AI Agent Meinung
      6. Risiko & Konfidenz
-   Deps: ModelEngine, State, fmtTime, formStrip, badgeInfo (all global)
+
+   Deps (global): ModelEngine, State, fmtTime, formStrip, badgeInfo
 ────────────────────────────────────────────────────────────────── */
 const Drawer = {
 
-  _isOpen: false,          // interner State — Source of Truth
-  _escHandler: null,       // Escape-Key Handler (cleanup on close)
-  _scrollY: 0,             // Scroll-Position vor Lock (iOS fix)
+  /* ── Interner State ──────────────────────────────────────── */
+  _isOpen:     false,   // JS Source-of-Truth (nicht nur CSS-Klasse)
+  _escHandler: null,    // Escape-Listener (wird bei close() entfernt)
+  _scrollY:    0,       // Scroll-Position vor Body-Lock (iOS-Fix)
 
+  /* ══════════════════════════════════════════════════════════
+     OPEN
+  ══════════════════════════════════════════════════════════ */
   open(id) {
     const m = State.allMatches.find(x => x.id === id);
     if (!m) return;
 
+    /* ── 1. Header befüllen ──────────────────────────────────── */
     const homeWin = m.predictedWinner === 'home';
     const awayWin = m.predictedWinner === 'away';
     const [bCls, bLabel] = badgeInfo(m);
 
-    // Wochentag aus kickoffAt berechnen (de-DE, z.B. "Samstag")
     const weekday = m.kickoffAt
       ? m.kickoffAt.toLocaleDateString('de-DE', { weekday: 'long' })
       : '';
 
     document.getElementById('drawer-league').innerHTML =
-      `${weekday ? `<span class="dh-weekday">${weekday}</span><span class="dh-sep">·</span>` : ''}` +
+      (weekday
+        ? `<span class="dh-weekday">${weekday}</span><span class="dh-sep">·</span>`
+        : '') +
       `${m.flag} <span>${m.competitionName}</span>` +
-      `<span class="dh-sep">·</span><span class="dh-time">${fmtTime(m.kickoffAt)} Uhr</span>`;
+      `<span class="dh-sep">·</span>` +
+      `<span class="dh-time">${fmtTime(m.kickoffAt)} Uhr</span>`;
+
     document.getElementById('dh-teams').textContent =
       `${m.homeTeam}  ×  ${m.awayTeam}`;
+
     document.getElementById('dh-tags').innerHTML =
       `<span class="badge ${bCls}">${bLabel}</span>` +
       m.riskTags.map(t => `<span class="rtag">${t}</span>`).join('');
 
-    // Run models (cached if available from earlier open)
+    /* ── 2. Body befüllen ────────────────────────────────────── */
     const models     = State.modelsByMatch[m.id] || ModelEngine.run(m);
     const ktipp      = ModelEngine.consensus(models);
     const mainModels = ModelEngine.mainModels(models);
@@ -58,103 +70,65 @@ const Drawer = {
       (aiAgent ? this._sectionAIAgent(aiAgent) : '') +
       this._sectionRisk(riskHtml, m);
 
-    // Scroll-Position merken und Body locken (iOS-safe)
+    /* ── 3. Body-Scroll sperren (iOS-safe) ───────────────────── */
     this._scrollY = window.scrollY;
-    document.body.style.overflow    = 'hidden';
-    document.body.style.position    = 'fixed';
-    document.body.style.top         = `-${this._scrollY}px`;
-    document.body.style.width       = '100%';
+    document.body.style.overflow = 'hidden';
+    document.body.style.position = 'fixed';
+    document.body.style.top      = `-${this._scrollY}px`;
+    document.body.style.width    = '100%';
 
-    // Overlay öffnen
+    /* ── 4. Overlay öffnen ───────────────────────────────────── */
     document.getElementById('drawer-overlay').classList.add('open');
     this._isOpen = true;
 
-    // Escape schließt Drawer
+    /* ── 5. Escape-Key ───────────────────────────────────────── */
     this._escHandler = (e) => { if (e.key === 'Escape') this.close(); };
     document.addEventListener('keydown', this._escHandler);
 
-    // Swipe-Down auf Handle/Header schließt Drawer.
-    // NUR auf Handle + Head — nicht auf scrollbarem Body.
-    const dr       = document.getElementById('drawer');
-    const drHandle = dr.querySelector('.drawer-handle');
-    const drHead   = dr.querySelector('.drawer-head');
-
+    /* ── 6. Swipe-Down (nur auf Handle + Head, nicht Body) ───── */
+    const dr = document.getElementById('drawer');
     let swipeStartY = 0;
 
-    const onTouchStart = (e) => {
-      swipeStartY = e.touches[0].clientY;
-    };
-    const onTouchMove = (e) => {
-      const delta = e.touches[0].clientY - swipeStartY;
-      if (delta > 70) this.close();
+    const onTouchStart = (e) => { swipeStartY = e.touches[0].clientY; };
+    const onTouchMove  = (e) => {
+      if (e.touches[0].clientY - swipeStartY > 70) this.close();
     };
 
-    [drHandle, drHead].forEach(el => {
-      if (!el) return;
-      el.addEventListener('touchstart', onTouchStart, { passive: true, once: true });
-      el.addEventListener('touchmove',  onTouchMove,  { passive: true, once: true });
-    });
+    [dr.querySelector('.drawer-handle'), dr.querySelector('.drawer-head')]
+      .forEach(el => {
+        if (!el) return;
+        el.addEventListener('touchstart', onTouchStart, { passive: true, once: true });
+        el.addEventListener('touchmove',  onTouchMove,  { passive: true, once: true });
+      });
   },
 
+  /* ══════════════════════════════════════════════════════════
+     CLOSE
+  ══════════════════════════════════════════════════════════ */
   close() {
-    if (!this._isOpen) return;   // Idempotent — kein Doppel-Close
+    if (!this._isOpen) return;  // Idempotent
 
+    /* ── Overlay schließen ───────────────────────────────────── */
     document.getElementById('drawer-overlay').classList.remove('open');
     this._isOpen = false;
 
-    // Escape Handler entfernen
+    /* ── Escape-Handler bereinigen ───────────────────────────── */
     if (this._escHandler) {
       document.removeEventListener('keydown', this._escHandler);
       this._escHandler = null;
     }
 
-    // Body-Lock aufheben und Scroll-Position wiederherstellen (iOS-safe)
+    /* ── Body-Lock aufheben + Scroll-Position wiederherstellen ── */
     document.body.style.overflow = '';
     document.body.style.position = '';
     document.body.style.top      = '';
     document.body.style.width    = '';
     window.scrollTo(0, this._scrollY);
   },
-    if (!m) return;
 
-    const homeWin = m.predictedWinner === 'home';
-    const awayWin = m.predictedWinner === 'away';
-    const [bCls, bLabel] = badgeInfo(m);
-
-    // Wochentag aus kickoffAt berechnen (de-DE, z.B. "Samstag")
-    const weekday = m.kickoffAt
-      ? m.kickoffAt.toLocaleDateString('de-DE', { weekday: 'long' })
-      : '';
-
-    document.getElementById('drawer-league').innerHTML =
-      `${weekday ? `<span class="dh-weekday">${weekday}</span><span class="dh-sep">·</span>` : ''}` +
-      `${m.flag} <span>${m.competitionName}</span>` +
-      `<span class="dh-sep">·</span><span class="dh-time">${fmtTime(m.kickoffAt)} Uhr</span>`;
-    document.getElementById('dh-teams').textContent =
-      `${m.homeTeam}  ×  ${m.awayTeam}`;
-    document.getElementById('dh-tags').innerHTML =
-      `<span class="badge ${bCls}">${bLabel}</span>` +
-      m.riskTags.map(t => `<span class="rtag">${t}</span>`).join('');
-
-    // Run models (cached if available from earlier open)
-    const models     = State.modelsByMatch[m.id] || ModelEngine.run(m);
-    const ktipp      = ModelEngine.consensus(models);
-    const mainModels = ModelEngine.mainModels(models);
-    const aiAgent    = ModelEngine.agentResult(models);
-
-    const riskHtml = m.riskTags.length
-      ? m.riskTags.map(t => `<span class="rtag-d">${t}</span>`).join('')
-      : '<span class="rtag-ok">✓ Keine Risiken erkannt</span>';
-
-    document.getElementById('drawer-body').innerHTML =
-      this._sectionProb(m, homeWin, awayWin) +
-      this._sectionStrengthForm(m) +
-      (ktipp ? this._sectionKtipp(ktipp) : '') +
-      this._sectionModelGrid(mainModels) +
-      (aiAgent ? this._sectionAIAgent(aiAgent) : '') +
-      this._sectionRisk(riskHtml, m);
-
-  /* ── Section renderers ──────────────────────────────────────── */
+  /* ══════════════════════════════════════════════════════════
+     SECTION RENDERERS
+  ══════════════════════════════════════════════════════════ */
 
   _sectionProb(m, homeWin, awayWin) {
     return `
@@ -268,13 +242,13 @@ const Drawer = {
       </div>`;
   },
 
-  /* ── Model card ─────────────────────────────────────────────── */
-
+  /* ── Model Card ─────────────────────────────────────────── */
   _modelCardHtml(mod) {
-    const confCls     = mod.confidence_score >= 65 ? 'high' : mod.confidence_score >= 45 ? 'mid' : 'low';
-    const isEnsemble  = mod.model_key === 'ensemble';
-    const factorsHtml = mod.factors_used.map(f => `<span class="mrf">${f}</span>`).join('');
-    const distHtml    = this._scoreDistHtml(mod.score_distribution);
+    const confCls    = mod.confidence_score >= 65 ? 'high'
+                     : mod.confidence_score >= 45 ? 'mid' : 'low';
+    const isEnsemble = mod.model_key === 'ensemble';
+    const factors    = mod.factors_used.map(f => `<span class="mrf">${f}</span>`).join('');
+    const dist       = this._scoreDistHtml(mod.score_distribution);
 
     return `
       <div class="model-card${isEnsemble ? ' is-ensemble' : ''}">
@@ -297,34 +271,26 @@ const Drawer = {
             <div class="mtc-val tip-conf ${confCls}">${mod.confidence_score}%</div>
           </div>
         </div>
-        ${distHtml}
+        ${dist}
         <div class="model-reason">
           ${mod.summary_reason}
-          <div class="model-reason-factors">${factorsHtml}</div>
+          <div class="model-reason-factors">${factors}</div>
         </div>
       </div>`;
   },
 
-  /**
-   * Render top-5 score distribution as a compact bar chart.
-   * Only shown for models that provide score_distribution (Poisson, DC).
-   * @param {Array<{score:string, prob:number}>|null} dist
-   */
   _scoreDistHtml(dist) {
     if (!dist || !dist.length) return '';
-
-    // Max prob is the 100% reference for bar widths
     const maxProb = dist[0].prob;
-
     const bars = dist.map((d, i) => {
       const pct      = Math.round(d.prob * 100);
       const barWidth = maxProb > 0 ? Math.round((d.prob / maxProb) * 100) : 0;
-      const isBest   = i === 0;
+      const top      = i === 0;
       return `
         <div class="sdist-row">
-          <span class="sdist-score${isBest ? ' sdist-score-top' : ''}">${d.score}</span>
+          <span class="sdist-score${top ? ' sdist-score-top' : ''}">${d.score}</span>
           <div class="sdist-bar-wrap">
-            <div class="sdist-bar${isBest ? ' sdist-bar-top' : ''}" style="width:${barWidth}%"></div>
+            <div class="sdist-bar${top ? ' sdist-bar-top' : ''}" style="width:${barWidth}%"></div>
           </div>
           <span class="sdist-pct">${pct}%</span>
         </div>`;
