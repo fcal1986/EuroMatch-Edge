@@ -4,7 +4,7 @@ name: Backtest Pipeline
 "on":
   # Täglich um 06:30 UTC — nach dem Daily Data Pipeline (06:00)
   schedule:
-    - cron: "30 6 * * *"
+    - cron: "30 6-23 * * *"
 
   # Manuell mit optionalen Parametern
   workflow_dispatch:
