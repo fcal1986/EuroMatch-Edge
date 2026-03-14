@@ -118,7 +118,7 @@ const History = {
       const params = new URLSearchParams([
         ['select',     '*'],
         ['match_date', `eq.${matchDate}`],
-        ['order',      'kickoff_at.asc'],
+        ['order',      'kickoff_at.asc'],  // Chronologisch innerhalb des Tages (früher → später)
         ['limit',      '50'],
       ]);
       if (State.historyFilter !== 'ALL') {

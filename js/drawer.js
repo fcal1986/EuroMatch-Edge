@@ -21,8 +21,15 @@ const Drawer = {
     const awayWin = m.predictedWinner === 'away';
     const [bCls, bLabel] = badgeInfo(m);
 
+    // Wochentag aus kickoffAt berechnen (de-DE, z.B. "Samstag")
+    const weekday = m.kickoffAt
+      ? m.kickoffAt.toLocaleDateString('de-DE', { weekday: 'long' })
+      : '';
+
     document.getElementById('drawer-league').innerHTML =
-      `${m.flag} <span>${m.competitionName}</span> · ${fmtTime(m.kickoffAt)} Uhr`;
+      `${weekday ? `<span class="dh-weekday">${weekday}</span><span class="dh-sep">·</span>` : ''}` +
+      `${m.flag} <span>${m.competitionName}</span>` +
+      `<span class="dh-sep">·</span><span class="dh-time">${fmtTime(m.kickoffAt)} Uhr</span>`;
     document.getElementById('dh-teams').textContent =
       `${m.homeTeam}  ×  ${m.awayTeam}`;
     document.getElementById('dh-tags').innerHTML =
