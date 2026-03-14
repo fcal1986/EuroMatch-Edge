@@ -14,7 +14,7 @@ name: Backtest Pipeline
         required: false
         default: ""
       competition:
-        description: "Liga-Code (z.B. BL1, PL, CL). Leer = alle Ligen."
+        description: "Interner Liga-Code (z.B. BUNDESLIGA, PREMIER_LEAGUE, CHAMPIONS_LEAGUE). Leer = alle aktiven."
         required: false
         default: ""
       dry_run:
@@ -72,6 +72,7 @@ jobs:
         env:
           SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          FOOTBALL_DATA_API_KEY:     ${{ secrets.FOOTBALL_DATA_API_KEY }}
         run: |
           echo "── backtest.py ${{ steps.params.outputs.flags }}"
           python backtest.py ${{ steps.params.outputs.flags }}
