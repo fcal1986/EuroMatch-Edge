@@ -509,84 +509,90 @@ a { color: inherit; text-decoration: none; }
 
 /* ══════════════════════════════════════════════════════════════
    DETAIL DRAWER
-   Mobile: echtes Bottom Sheet — Höhe fixiert, Scroll im Inhalt.
-   Desktop (≥640px): zentriertes Modal.
+   Mobile (<640px): Bottom Sheet von unten, Höhe 92dvh.
+   Desktop (≥640px): zentriertes Modal, natürliche Höhe.
 ══════════════════════════════════════════════════════════════ */
-.overlay {
-  position: fixed; inset: 0; z-index: 300;
-  background: rgba(0,0,0,0.72);
-  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
-  display: flex; align-items: flex-end; justify-content: center;
-  opacity: 0; pointer-events: none; transition: opacity .25s;
-}
-.overlay.open { opacity: 1; pointer-events: all; }
 
-/* ── Mobile Bottom Sheet ──────────────────────────────────────
-   Das Sheet bekommt eine feste Höhe (92dvh), damit der Browser
-   weiß, wie hoch der Container ist. Nur dann arbeitet
-   overflow-y: auto auf dem richtigen Element.
-   Flex-Column teilt den Platz: Header sticky oben, Body scrollt.
-────────────────────────────────────────────────────────────── */
+/* ── Overlay / Backdrop ─────────────────────────────────────── */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  background: rgba(0,0,0,0.72);
+  /* backdrop-filter ENTFERNT: erzeugt Stacking Context der
+     z-index aller Kinder bricht und Klicks auf Header blockiert */
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  /* Geschlossen: unsichtbar UND keine Pointer-Events */
+  opacity: 0;
+  visibility: hidden;       /* Zusätzlich zu pointer-events — Safari-Fix */
+  pointer-events: none;
+  transition: opacity .25s, visibility .25s;
+}
+.overlay.open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: all;
+}
+
+/* ── Drawer (Mobile Bottom Sheet) ───────────────────────────── */
 .drawer {
-  /* Positionierung */
   background: var(--bg-1);
   width: 100%;
   max-width: 640px;
 
-  /* Feste Höhe — das ist der entscheidende Fix.
-     dvh = dynamic viewport height: berücksichtigt Chrome-Mobile-UI.
-     Ohne explizite height bekommt overflow-y: auto nichts zum Messen. */
+  /* Mobile: feste Höhe damit overflow-y:auto im Body wirkt */
   height: 92dvh;
   max-height: 92dvh;
 
-  /* Bottom Sheet Form */
   border-radius: 20px 20px 0 0;
   border-top: 1px solid var(--border-md);
 
-  /* Flex-Column: Handle + Header bleiben oben, Body scrollt */
+  /* Flex-Column: Handle + Head fixed oben, Body scrollt */
   display: flex;
   flex-direction: column;
-  overflow: hidden;           /* Kein scroll auf .drawer selbst */
+  overflow: hidden;
 
-  /* Slide-in Animation */
+  /* Slide-in von unten */
   transform: translateY(100%);
   transition: transform .3s cubic-bezier(.32,.72,0,1);
 }
 .overlay.open .drawer { transform: translateY(0); }
 
-/* Swipe-Handle */
+/* ── Handle ──────────────────────────────────────────────────── */
 .drawer-handle {
   width: 36px; height: 4px;
   background: var(--bg-4);
   border-radius: 99px;
   margin: 12px auto 4px;
-  flex-shrink: 0;             /* Nicht wegsquetschen */
+  flex-shrink: 0;
 }
 
-/* Header: klebt oben, scrollt nicht mit */
+/* ── Header ──────────────────────────────────────────────────── */
 .drawer-head {
-  padding: 12px 52px 14px 18px; /* rechts: Platz für Close-Button */
+  padding: 12px 52px 14px 18px;  /* rechts: Platz für Close-Button */
   border-bottom: 1px solid var(--border);
   background: var(--bg-1);
-  flex-shrink: 0;             /* Immer sichtbar */
-  position: relative;         /* Für .drawer-close absolut */
+  flex-shrink: 0;
+  position: relative;             /* Für .drawer-close absolut */
 }
 
-/* Body: scrollbarer Bereich — nimmt restliche Höhe */
+/* ── Scrollbarer Body ────────────────────────────────────────── */
 .drawer-body {
-  flex: 1;                    /* Füllt alles nach Header */
-  overflow-y: auto;           /* Scroll hier, nicht am Drawer */
+  flex: 1;
+  overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
   scrollbar-width: none;
-  min-height: 0;              /* Verhindert flex-overflow in Safari */
+  min-height: 0;                  /* Safari flex bug fix */
   padding: 18px;
   box-sizing: border-box;
 }
 .drawer-body::-webkit-scrollbar { display: none; }
 
-/* Schließen-Button — absolut in drawer-head */
+/* ── Schließen-Button ────────────────────────────────────────── */
 .drawer-close {
   position: absolute;
   top: 14px; right: 14px;
@@ -601,16 +607,14 @@ a { color: inherit; text-decoration: none; }
   z-index: 2;
 }
 .drawer-close:hover { background: var(--bg-4); }
-/* SVG innerhalb des Buttons sichtbar machen */
-.drawer-close svg { display: block; pointer-events: none; }
+.drawer-close svg   { display: block; pointer-events: none; }
 
-/* ── Desktop Modal (≥640px) ──────────────────────────────────
-   Zentriertes Modal, kein Bottom Sheet.
-────────────────────────────────────────────────────────────── */
+/* ── Desktop Modal (≥640px) ──────────────────────────────────── */
 @media (min-width: 640px) {
   .overlay { align-items: center; }
   .drawer {
-    height: auto;             /* Auf Desktop: natürliche Höhe */
+    /* !important: überschreibt mobile height:92dvh sicher */
+    height: auto !important;
     max-height: 88dvh;
     border-radius: 16px;
     border: 1px solid var(--border-md);
@@ -618,7 +622,6 @@ a { color: inherit; text-decoration: none; }
   }
   .overlay.open .drawer { transform: translateY(0) scale(1); }
   .drawer-handle { display: none !important; }
-  /* Body-Scroll bleibt gleich, nur Höhe ändert sich */
 }
 .prob3 {
   display: grid;
