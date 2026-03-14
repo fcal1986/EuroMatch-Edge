@@ -27,6 +27,16 @@
       <div class="logo-name">Euro<span>Match</span> Edge</div>
     </div>
 
+    <!-- ── Navigation Tabs ──────────────────────────────────── -->
+    <nav class="nav-tabs" id="nav-tabs">
+      <button class="nav-tab active" id="tab-forecast" onclick="App.switchTab('forecast')">
+        ⚽ Prognosen
+      </button>
+      <button class="nav-tab" id="tab-history" onclick="App.switchTab('history')">
+        📋 Verlauf
+      </button>
+    </nav>
+
     <div class="header-date" id="header-date">–</div>
 
     <div class="header-search" id="header-search">
@@ -138,6 +148,46 @@
 
 </main>
 
+<!-- ══ HISTORY PAGE ═══════════════════════════════════════════════
+     Standardmäßig versteckt. Wird per App.switchTab('history')
+     eingeblendet. Baut auf den gleichen CSS-Klassen wie die
+     Hauptseite auf.
+══════════════════════════════════════════════════════════════════ -->
+<main class="page page-history" id="page-history" style="display:none">
+
+  <!-- Tages-Navigation: Prev ◀ Datum ▶ Next -->
+  <div id="hist-day-nav">
+    <!-- wird von History._renderNav() befüllt -->
+  </div>
+
+  <!-- KPI Strip — basiert auf dem ausgewählten Tag -->
+  <div class="kpi-strip" id="hist-kpi-strip">
+    <div class="kpi k-lime"><div class="kpi-label">Prognosen</div><div class="kpi-val">–</div><div class="kpi-sub">an diesem Tag</div></div>
+    <div class="kpi k-lime"><div class="kpi-label">⚡ Exakt</div><div class="kpi-val">–</div><div class="kpi-sub">–</div></div>
+    <div class="kpi k-sky"><div class="kpi-label">✓ Tordiff.</div><div class="kpi-val">–</div><div class="kpi-sub">–</div></div>
+    <div class="kpi k-amber"><div class="kpi-label">↗ Tendenz</div><div class="kpi-val">–</div><div class="kpi-sub">–</div></div>
+    <div class="kpi k-red"><div class="kpi-label">✕ Daneben</div><div class="kpi-val">–</div><div class="kpi-sub">–</div></div>
+    <div class="kpi k-sky"><div class="kpi-label">Trefferquote</div><div class="kpi-val">–</div><div class="kpi-sub">–</div></div>
+  </div>
+
+  <!-- Liga-Filter -->
+  <div class="filter-panel">
+    <div class="league-bar" id="hist-filter-bar"></div>
+  </div>
+
+  <!-- Lade-Indikator -->
+  <div class="hist-loading" id="hist-loading" style="display:none">
+    <div class="hist-spinner"></div>
+    <span>Lade historische Prognosen…</span>
+  </div>
+
+  <!-- Spiele-Liste dieses Tages -->
+  <section class="matches-section">
+    <div class="match-list" id="hist-list"></div>
+  </section>
+
+</main>
+
 <footer>
   EuroMatch Edge — Daten via Supabase · <span id="footer-updated">–</span>
 </footer>
@@ -218,7 +268,10 @@
 <!-- Tier 9: Backtesting (READ-ONLY, kein Supabase-Write) -->
 <script src="js/backtest/backtest-engine.js"></script>
 
-<!-- Tier 10: App-Controller -->
+<!-- Tier 10: History (braucht CFG, State, Utils) -->
+<script src="js/history.js"></script>
+
+<!-- Tier 11: App-Controller -->
 <script src="js/app.js"></script>
 
 </body>
