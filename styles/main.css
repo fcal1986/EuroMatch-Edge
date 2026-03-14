@@ -919,3 +919,131 @@ footer { border-top: 1px solid var(--border); padding: 14px var(--sp-md); font-s
   .page-history .kpi-strip { grid-template-columns: repeat(2, 1fr); }
   .hist-nav-date { font-size: 13px; }
 }
+
+/* ══════════════════════════════════════════════════════════════
+   MOBILE UX FIXES
+   Minimal-invasive Patches für bestehende Komponenten.
+   Keine bestehenden Klassen werden entfernt oder umbenannt.
+══════════════════════════════════════════════════════════════ */
+
+/* ── 1. Drawer Header: Wochentag + mobile overflow ─────────── */
+
+/* Wochentag-Element im dh-league Header */
+.dh-weekday {
+  color: var(--t-primary);
+  font-weight: 800;
+  text-transform: capitalize;  /* "Samstag" nicht "SAMSTAG" */
+  letter-spacing: 0;            /* reset vom uppercase */
+  font-size: 12px;
+}
+.dh-sep {
+  color: var(--t-muted);
+  font-weight: 400;
+}
+.dh-time {
+  white-space: nowrap;
+}
+
+/* dh-league: flex-wrap auf kleinen Screens */
+.dh-league {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+
+/* dh-teams: Team-Namen umbrechen statt overflow */
+.dh-teams {
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+/* Kleinere Schrift auf sehr schmalen Screens */
+@media (max-width: 380px) {
+  .dh-teams { font-size: 18px; }
+}
+
+/* Drawer-Body: kein horizontaler Overflow */
+.drawer-body {
+  overflow-x: hidden;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+/* ── 2. Drawer: Model-Cards mobile ─────────────────────────── */
+
+/* model-tips: 3 Spalten können auf < 320px überlaufen */
+@media (max-width: 360px) {
+  .model-tips {
+    grid-template-columns: 1fr 1fr;
+  }
+  /* Konfidenz-Zelle in zweite Zeile */
+  .model-tip-cell:last-child {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--border);
+    text-align: center;
+  }
+}
+
+/* model-reason-factors: wrap sicherstellen */
+.model-reason-factors {
+  flex-wrap: wrap;
+}
+
+/* ── 3. Drawer: Kicktipp-Box mobile ────────────────────────── */
+
+/* ktipp-box: flex-wrap falls Inhalt zu breit */
+.ktipp-box {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+/* ktipp-label: umbrechen statt overflow */
+.ktipp-label {
+  white-space: normal;
+  word-break: break-word;
+}
+
+/* ── 4. Drawer: Wahrscheinlichkeits-Grid mobile ─────────────── */
+
+/* p3-name (Teamname in Prob-Grid) überlaufen verhindern */
+.p3-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── 5. Header Search: Layout-Stabilität ───────────────────── */
+
+/* Nav-Tabs + Search: auf sehr kleinen Screens (< 380px) */
+@media (max-width: 380px) {
+  .nav-tab {
+    font-size: 10px;
+    padding: 4px 7px;
+  }
+  .nav-tabs {
+    gap: 2px;
+  }
+  /* Suchfeld erhält weniger Platz — Tabs bleiben sichtbar */
+  .header-search {
+    flex: 0 0 34px;
+  }
+  .header-search.expanded {
+    flex: 1;
+  }
+}
+
+/* ── 6. Verlauf: Neueste Tage oben — visuell bestätigen ─────── */
+
+/* v_history_days liefert bereits DESC — keine JS-Änderung nötig.
+   CSS-Hinweis: hist-nav-bar sticky ist korrekt, kein Fix nötig. */
+
+/* ── 7. Verlauf: Filter gleiche UX wie Prognosen-Tab ───────── */
+
+/* hist-filter-bar nutzt bereits .lchip — CSS ist identisch.
+   Nur Scroll-Padding auf Mobile sicherstellen: */
+.page-history .filter-panel {
+  /* Verhindert dass aktiver Chip hinter Nav-Bar verschwindet */
+  scroll-padding-inline: var(--sp-md);
+}
+
+/* ── 8. Allgemein: overflow-x auf Page-Containern ──────────── */
+.page, .page-history {
+  overflow-x: hidden;
+}
