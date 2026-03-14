@@ -1,4 +1,8 @@
-# EuroMatch Edge — pipeline dependencies
-# Kept minimal: only what fetch_matches.py and compute_predictions.py actually import.
+# EuroMatch Edge — Pipeline-Abhängigkeiten
+# Minimal: nur was die Scripts tatsächlich importieren.
 
+# HTTP-Client (fetch_matches, enrich_matches, compute_predictions, backtest)
 requests==2.32.3
+
+# .env-Unterstützung für lokale Entwicklung (backtest.py)
+python-dotenv==1.0.1
