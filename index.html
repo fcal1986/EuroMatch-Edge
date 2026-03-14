@@ -472,6 +472,47 @@ a { color: inherit; text-decoration: none; }
 .empty p { font-size: 13px; }
 
 /* ══════════════════════════════════════════════════════════════
+   MODEL COMPARISON — Drawer section
+══════════════════════════════════════════════════════════════ */
+.model-grid { display: flex; flex-direction: column; gap: 8px; margin-bottom: 18px; }
+.model-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--r-card); overflow: hidden; }
+.model-card.is-ensemble { border-color: var(--lime-border); }
+.model-card.is-ai-agent { border-color: rgba(56,189,248,.25); }
+.model-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px 7px; border-bottom: 1px solid var(--border); }
+.model-icon { width: 22px; height: 22px; border-radius: 5px; display: grid; place-items: center; flex-shrink: 0; font-size: 11px; }
+.model-icon.ensemble { background: var(--lime-dim); color: var(--lime); }
+.model-icon.elo      { background: var(--sky-dim);  color: var(--sky); }
+.model-icon.poisson  { background: rgba(52,211,153,.1); color: var(--green); }
+.model-icon.market   { background: var(--amber-dim); color: var(--amber); }
+.model-icon.dc       { background: rgba(168,85,247,.1); color: #a855f7; }
+.model-icon.ai       { background: var(--sky-dim);  color: var(--sky); }
+.model-name { font-family: var(--f-display); font-size: 12px; font-weight: 800; letter-spacing: .4px; text-transform: uppercase; color: var(--t-primary); flex: 1; }
+.model-version { font-size: 10px; color: var(--t-muted); }
+.model-tips { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1px; background: var(--border); }
+.model-tip-cell { background: var(--bg-2); padding: 7px 10px; text-align: center; }
+.model-tip-cell:first-child { text-align: left; }
+.model-tip-cell:last-child  { text-align: right; }
+.mtc-label { font-size: 9px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; color: var(--t-muted); margin-bottom: 3px; }
+.mtc-val   { font-family: var(--f-display); font-size: 18px; font-weight: 900; color: var(--t-primary); line-height: 1; }
+.mtc-val.tip-main { color: var(--lime); }
+.mtc-val.tip-alt  { color: var(--t-secondary); font-size: 15px; }
+.mtc-val.tip-conf.high { color: var(--lime); }
+.mtc-val.tip-conf.mid  { color: var(--amber); }
+.mtc-val.tip-conf.low  { color: var(--t-muted); }
+.model-reason { padding: 8px 12px 9px; font-size: 12px; color: var(--t-secondary); line-height: 1.55; }
+.model-reason-factors { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.mrf { font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 4px; background: var(--bg-3); border: 1px solid var(--border); color: var(--t-muted); }
+.ktipp-box { background: var(--lime-dim); border: 1px solid var(--lime-border); border-radius: var(--r-card); padding: 12px 14px; margin-bottom: 14px; display: flex; align-items: center; gap: 12px; }
+.ktipp-score { font-family: var(--f-display); font-size: 36px; font-weight: 900; color: var(--lime); line-height: 1; flex-shrink: 0; }
+.ktipp-info { flex: 1; min-width: 0; }
+.ktipp-label { font-size: 10px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; color: var(--lime); margin-bottom: 4px; }
+.ktipp-sub { font-size: 12px; color: var(--t-secondary); line-height: 1.45; }
+.ai-agent-box { background: var(--sky-dim); border: 1px solid rgba(56,189,248,.2); border-radius: var(--r-card); padding: 12px 14px; margin-bottom: 14px; }
+.ai-agent-head { display: flex; align-items: center; gap: 7px; font-size: 10px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; color: var(--sky); margin-bottom: 7px; }
+.ai-agent-status { margin-left: auto; font-size: 9px; font-weight: 700; letter-spacing: .4px; padding: 1px 6px; border-radius: 99px; background: rgba(56,189,248,.15); color: var(--sky); border: 1px solid rgba(56,189,248,.2); }
+.ai-agent-text { font-size: 12px; color: var(--t-secondary); line-height: 1.55; }
+
+/* ══════════════════════════════════════════════════════════════
    SKELETON
 ══════════════════════════════════════════════════════════════ */
 @keyframes shimmer { from { background-position: 200% center; } to { background-position: -200% center; } }
@@ -910,6 +951,307 @@ const MOCK_ROWS = [
     ai_reason:'Keine Standings-Daten für CL verfügbar. Formbasiert leicht für Atlético. Heimvorteil eingerechnet.' },
 ];
 
+/* ── ModelEngine ─────────────────────────────────────────────
+   Generates multi-model predictions per match.
+   Each model output follows this schema:
+   {
+     model_key:      string   — unique identifier
+     model_name:     string   — human display name
+     model_version:  string
+     icon_class:     string   — CSS class for .model-icon
+     predicted_winner: 'home'|'away'|'draw'
+     main_score_tip: string   — e.g. '2:1'
+     alt_score_tip:  string   — e.g. '1:0'
+     confidence_score: number — 0–100
+     risk_level:     'low'|'medium'|'high'
+     summary_reason: string   — 1–2 short sentences for the user
+     factors_used:   string[] — short factor tags
+     is_ai_agent:    boolean
+   }
+────────────────────────────────────────────────────────────── */
+const ModelEngine = {
+
+  /** Run all models for a single match. Returns array of model outputs. */
+  run(m) {
+    const models = [
+      this._ensemble(m),
+      this._elo(m),
+      this._poisson(m),
+      this._dixonColes(m),
+      this._market(m),
+      this._aiAgentPlaceholder(m),
+    ];
+    return models;
+  },
+
+  // ── helpers ──────────────────────────────────────────────────
+
+  _formScore(form) {
+    // W=3, D=1, L=0, normalised 0–1
+    if (!form || !form.length) return 0.5;
+    const pts = form.reduce((s,r) => s + (r==='W'?3:r==='D'?1:0), 0);
+    return pts / (form.length * 3);
+  },
+
+  _strengthDiff(m) {
+    // +1 = home dominant, -1 = away dominant
+    if (m.homeStrength == null || m.awayStrength == null) return 0;
+    return (m.homeStrength - m.awayStrength) / 100;
+  },
+
+  _winnerLabel(winner, m) {
+    if (winner === 'home') return m.homeTeam.split(' ').slice(-1)[0];
+    if (winner === 'away') return m.awayTeam.split(' ').slice(-1)[0];
+    return 'Remis';
+  },
+
+  _riskLevel(conf) {
+    return conf >= 65 ? 'low' : conf >= 45 ? 'medium' : 'high';
+  },
+
+  /** Heuristic score-tip based on strengths & form */
+  _scoreTip(homeGoals, awayGoals) {
+    return `${Math.round(homeGoals)}:${Math.round(awayGoals)}`;
+  },
+
+  // ── Models ───────────────────────────────────────────────────
+
+  /** Ensemble: weighted average of all sub-models */
+  _ensemble(m) {
+    const diff   = this._strengthDiff(m);
+    const formH  = this._formScore(m.formHome);
+    const formA  = this._formScore(m.formAway);
+    const formAdv = formH - formA;
+    // Combine existing pipeline output with form
+    const raw = (m.winProbability / 100) * 0.6 + (0.5 + diff * 0.25 + formAdv * 0.15);
+    const homeWinP = Math.min(0.95, Math.max(0.05, raw / 1.6));
+    const winner   = homeWinP > 0.55 ? 'home' : homeWinP < 0.40 ? 'away' : 'draw';
+    const conf     = Math.round(50 + Math.abs(homeWinP - 0.5) * 80);
+    const hg = 1.2 + diff * 1.5 + formAdv * 0.5;
+    const ag = 0.7 - diff * 0.8 + (1-formAdv) * 0.3;
+    return {
+      model_key: 'ensemble', model_name: 'Ensemble', model_version: '1.0',
+      icon_class: 'ensemble', predicted_winner: winner,
+      main_score_tip: this._scoreTip(Math.max(0,hg), Math.max(0,ag)),
+      alt_score_tip:  this._scoreTip(Math.max(0,hg-1), Math.max(0,ag)),
+      confidence_score: conf, risk_level: this._riskLevel(conf),
+      summary_reason: this._ensembleReason(m, winner, diff, formAdv),
+      factors_used: ['Stärke', 'Form', 'Pipeline', 'Heimvorteil'],
+      is_ai_agent: false,
+    };
+  },
+
+  _ensembleReason(m, winner, diff, formAdv) {
+    if (winner === 'draw') return 'Beide Teams liegen nah beieinander. Remis ist eine reale Option.';
+    const side = winner === 'home' ? m.homeTeam.split(' ').slice(-1)[0] : m.awayTeam.split(' ').slice(-1)[0];
+    if (Math.abs(diff) > 0.4) return `${side} ist klar stärker und sollte dieses Spiel gewinnen.`;
+    if (Math.abs(formAdv) > 0.3) return `${side} bringt die bessere Tagesform mit – knappes Ergebnis erwartet.`;
+    return `Leichter Vorteil für ${side}, aber das Spiel bleibt eng.`;
+  },
+
+  /** Elo-inspired: pure team-strength-based */
+  _elo(m) {
+    const diff = this._strengthDiff(m);
+    const homeWinP = 1 / (1 + Math.pow(10, -(diff * 4 + 0.1))); // 0.1 = home adv
+    const winner   = homeWinP > 0.58 ? 'home' : homeWinP < 0.38 ? 'away' : 'draw';
+    const conf     = Math.round(45 + Math.abs(homeWinP - 0.5) * 90);
+    const hg = 1.0 + diff * 1.8;
+    const ag = 0.9 - diff * 0.9;
+    return {
+      model_key: 'elo', model_name: 'Elo', model_version: '1.0',
+      icon_class: 'elo', predicted_winner: winner,
+      main_score_tip: this._scoreTip(Math.max(0,hg), Math.max(0,ag)),
+      alt_score_tip:  this._scoreTip(Math.max(1,hg), Math.max(0,ag-1)),
+      confidence_score: conf, risk_level: this._riskLevel(conf),
+      summary_reason: this._eloReason(m, winner, diff),
+      factors_used: ['Teamstärke', 'Heimvorteil'],
+      is_ai_agent: false,
+    };
+  },
+
+  _eloReason(m, winner, diff) {
+    if (m.homeStrength == null) return 'Keine Stärkedaten – Elo kann nicht berechnet werden.';
+    const side = winner === 'home' ? m.homeTeam.split(' ').slice(-1)[0] : winner === 'away' ? m.awayTeam.split(' ').slice(-1)[0] : null;
+    if (!side) return 'Stärke-Unterschied zu gering für eine klare Empfehlung.';
+    if (Math.abs(diff) > 0.4) return `${side} liegt im Elo-Rating deutlich vorne. Sieg sehr wahrscheinlich.`;
+    return `${side} hat einen leichten Elo-Vorsprung, aber der Gegner ist konkurrenzfähig.`;
+  },
+
+  /** Poisson: goal expectation model */
+  _poisson(m) {
+    const diff  = this._strengthDiff(m);
+    const formH = this._formScore(m.formHome);
+    const formA = this._formScore(m.formAway);
+    // Expected goals: league average ~1.4 home, ~1.1 away, adjusted by strength & form
+    const lambdaH = Math.max(0.3, 1.4 + diff * 1.2 + (formH - 0.5) * 0.6);
+    const lambdaA = Math.max(0.3, 1.1 - diff * 0.8 + (formA - 0.5) * 0.4);
+    // P(home win) via Poisson approximation
+    const pHome = this._poissonWinProb(lambdaH, lambdaA);
+    const pAway = this._poissonWinProb(lambdaA, lambdaH);
+    const pDraw = 1 - pHome - pAway;
+    const winner = pHome > pAway && pHome > pDraw ? 'home'
+                 : pAway > pHome && pAway > pDraw ? 'away' : 'draw';
+    const conf = Math.round(Math.max(pHome, pAway, pDraw) * 100);
+    return {
+      model_key: 'poisson', model_name: 'Poisson', model_version: '1.0',
+      icon_class: 'poisson', predicted_winner: winner,
+      main_score_tip: this._scoreTip(lambdaH, lambdaA),
+      alt_score_tip:  this._scoreTip(Math.max(0,lambdaH-0.5), Math.max(0,lambdaA+0.3)),
+      confidence_score: Math.min(95, conf), risk_level: this._riskLevel(conf),
+      summary_reason: this._poissonReason(m, winner, lambdaH, lambdaA),
+      factors_used: ['Torerwartung', 'Form', 'Stärke'],
+      is_ai_agent: false,
+    };
+  },
+
+  _poissonWinProb(lambdaA, lambdaB) {
+    // P(A goals > B goals) simplified – 5x5 grid
+    let p = 0;
+    for (let a = 0; a <= 5; a++) {
+      for (let b = 0; b < a; b++) {
+        p += this._pois(a, lambdaA) * this._pois(b, lambdaB);
+      }
+    }
+    return Math.min(0.9, p);
+  },
+
+  _pois(k, lambda) {
+    // P(X=k) for Poisson
+    let e = Math.exp(-lambda), prod = 1;
+    for (let i = 1; i <= k; i++) prod *= lambda / i;
+    return e * prod;
+  },
+
+  _poissonReason(m, winner, lH, lA) {
+    const side = winner === 'home' ? m.homeTeam.split(' ').slice(-1)[0] : winner === 'away' ? m.awayTeam.split(' ').slice(-1)[0] : null;
+    if (!side) return `Das Modell erwartet ein torreiches Remis (~${lH.toFixed(1)}:${lA.toFixed(1)}).`;
+    return `${side} erzielt laut Erwartungswert mehr Tore (λ ${lH.toFixed(1)} vs ${lA.toFixed(1)}).`;
+  },
+
+  /** Dixon–Coles inspired: adds draw-correction for low-scoring games */
+  _dixonColes(m) {
+    const diff  = this._strengthDiff(m);
+    const formH = this._formScore(m.formHome);
+    const formA = this._formScore(m.formAway);
+    const lambdaH = Math.max(0.3, 1.3 + diff * 1.0 + (formH - 0.5) * 0.5);
+    const lambdaA = Math.max(0.3, 1.0 - diff * 0.7 + (formA - 0.5) * 0.4);
+    // Draw inflation when both teams are close and goals are low
+    const drawBoost = (Math.abs(diff) < 0.15 && lambdaH < 1.5 && lambdaA < 1.5) ? 0.10 : 0;
+    const pHome = this._poissonWinProb(lambdaH, lambdaA) * (1 - drawBoost);
+    const pAway = this._poissonWinProb(lambdaA, lambdaH) * (1 - drawBoost);
+    const pDraw = Math.min(0.5, 1 - pHome - pAway + drawBoost);
+    const winner = pHome > pAway && pHome > pDraw ? 'home'
+                 : pAway > pHome && pAway > pDraw ? 'away' : 'draw';
+    const conf = Math.round(Math.max(pHome, pAway, pDraw) * 100);
+    return {
+      model_key: 'dc', model_name: 'Dixon–Coles', model_version: '1.0',
+      icon_class: 'dc', predicted_winner: winner,
+      main_score_tip: this._scoreTip(lambdaH, lambdaA),
+      alt_score_tip:  drawBoost > 0 ? '1:1' : this._scoreTip(Math.max(0,lambdaH-0.5), lambdaA),
+      confidence_score: Math.min(95, conf), risk_level: this._riskLevel(conf),
+      summary_reason: this._dcReason(m, winner, drawBoost),
+      factors_used: ['Torerwartung', 'Remis-Korrektur', 'Stärke'],
+      is_ai_agent: false,
+    };
+  },
+
+  _dcReason(m, winner, drawBoost) {
+    if (drawBoost > 0) return 'Teams liegen nah beieinander – das Modell erhöht die Remis-Wahrscheinlichkeit für Kicktipp-Vorsicht.';
+    const side = winner === 'home' ? m.homeTeam.split(' ').slice(-1)[0] : winner === 'away' ? m.awayTeam.split(' ').slice(-1)[0] : null;
+    if (!side) return 'Remis leicht wahrscheinlicher als die Basismodelle zeigen.';
+    return `${side} laut DC-Modell vorne, aber knappes Ergebnis mit wenigen Toren erwartet.`;
+  },
+
+  /** Market / Odds model */
+  _market(m) {
+    const quote = m.marketSignalHome ?? 2.0;
+    // Convert odds to implied probability
+    const impliedHomeP = Math.min(0.92, Math.max(0.08, 1 / quote * 0.9));
+    const winner = impliedHomeP > 0.55 ? 'home' : impliedHomeP < 0.40 ? 'away' : 'draw';
+    const conf = Math.round(40 + impliedHomeP * 45);
+    const diff = this._strengthDiff(m);
+    const hg = 0.9 + diff * 1.2;
+    const ag = 0.8 - diff * 0.6;
+    return {
+      model_key: 'market', model_name: 'Markt', model_version: '1.0',
+      icon_class: 'market', predicted_winner: winner,
+      main_score_tip: this._scoreTip(Math.max(0,hg), Math.max(0,ag)),
+      alt_score_tip:  this._scoreTip(Math.max(0,hg), Math.max(0,ag+1)),
+      confidence_score: Math.min(90, conf), risk_level: this._riskLevel(conf),
+      summary_reason: this._marketReason(m, winner, quote),
+      factors_used: ['Marktquoten', 'Implied Probability'],
+      is_ai_agent: false,
+    };
+  },
+
+  _marketReason(m, winner, quote) {
+    if (!m.marketSignalHome) return 'Keine Marktdaten verfügbar.';
+    const side = winner === 'home' ? m.homeTeam.split(' ').slice(-1)[0] : winner === 'away' ? m.awayTeam.split(' ').slice(-1)[0] : null;
+    if (!side) return `Markt sieht ein offenes Spiel – Quote Heimsieg: ${quote.toFixed(2)}.`;
+    if (quote <= 1.3) return `Sehr niedrige Quote (${quote.toFixed(2)}) – Markt ist sich sehr sicher bei ${side}.`;
+    if (quote <= 1.6) return `Klare Markt-Favorisierung von ${side} (Quote ${quote.toFixed(2)}).`;
+    return `Markt sieht ${side} leicht vorne, aber das Rennen ist offen (Quote ${quote.toFixed(2)}).`;
+  },
+
+  /**
+   * AI Agent placeholder — architecture ready for API injection.
+   * Replace body of this method to call a real AI API.
+   * Contract: same return shape as other models.
+   */
+  _aiAgentPlaceholder(m) {
+    // When a real AI response is available, inject it here via:
+    // State.aiAgentResults[m.id] = { summary, main_score_tip, ... }
+    const cached = State.aiAgentResults[m.id];
+    if (cached) return { ...cached, model_key: 'ai_agent', icon_class: 'ai', is_ai_agent: true };
+
+    // Derive a simple default opinion from ensemble direction
+    const diff    = this._strengthDiff(m);
+    const formAdv = this._formScore(m.formHome) - this._formScore(m.formAway);
+    const ensemble = this._ensemble(m);
+    const agreement = Math.abs(diff) > 0.25 || Math.abs(formAdv) > 0.25;
+    const cautious  = m.riskTags.length > 0 || m.riskLevel === 'high';
+    let reason;
+    if (cautious && !agreement) reason = 'Der Agent sieht erhöhte Unsicherheit und rät zur Vorsicht – Risikofaktoren aktiv.';
+    else if (cautious)  reason = `Agent stimmt dem Ensemble zu, weist aber auf ${m.riskTags[0] ?? 'Risikofaktor'} hin.`;
+    else if (!agreement) reason = 'Agent: Prognose wenig eindeutig – eher konservativ tippen.';
+    else reason = 'Agent bestätigt das Ensemble-Modell. Kein Widerspruch zu den Hauptfaktoren.';
+
+    return {
+      model_key: 'ai_agent', model_name: 'AI Agent', model_version: 'preview',
+      icon_class: 'ai', predicted_winner: ensemble.predicted_winner,
+      main_score_tip: ensemble.main_score_tip,
+      alt_score_tip:  ensemble.alt_score_tip,
+      confidence_score: Math.max(20, ensemble.confidence_score - 10),
+      risk_level: cautious ? 'high' : ensemble.risk_level,
+      summary_reason: reason,
+      factors_used: ['Ensemble', 'Risiko', 'Kontext'],
+      is_ai_agent: true,
+    };
+  },
+
+  /**
+   * Kicktipp consensus: picks the most-agreed-upon score tip across models.
+   * Returns { score, reason, backing_models }
+   */
+  consensus(models) {
+    const votes = {};
+    models.forEach(mod => {
+      if (mod.is_ai_agent) return; // exclude AI from vote
+      votes[mod.main_score_tip] = (votes[mod.main_score_tip] || 0) + 1;
+    });
+    const top = Object.entries(votes).sort((a,b) => b[1]-a[1])[0];
+    if (!top) return null;
+    const score = top[0], count = top[1];
+    const backing = models.filter(mod => mod.main_score_tip === score && !mod.is_ai_agent).map(mod => mod.model_name);
+    const reason = count >= 3
+      ? `${count} von 4 Modellen tippen auf ${score} – starker Konsens.`
+      : count === 2
+        ? `2 Modelle einigen sich auf ${score}. Solider Kicktipp.`
+        : `Kein Konsens – ${score} ist die häufigste Einzelmeinung.`;
+    return { score, count, reason, backing_models: backing };
+  },
+};
+
 /* ── DataLayer ───────────────────────────────────────────────── */
 const DataLayer = {
   _lastSource: 'mock',
@@ -981,6 +1323,9 @@ const State = {
 
   // Collapsed day-groups: Set of day-keys (e.g. '2025-03-15'), in-memory only
   collapsedDays: new Set(),
+
+  // AI Agent results: map of match_id → agent output object (injected externally or via API)
+  aiAgentResults: {},
 
   filtered() {
     let items = this.allMatches;
@@ -1250,6 +1595,12 @@ const Drawer = {
       ? m.riskTags.map(t=>`<span class="rtag-d">${t}</span>`).join('')
       : '<span class="rtag-ok">✓ Keine Risiken erkannt</span>';
 
+    // Run all models for this match
+    const models   = ModelEngine.run(m);
+    const ktipp    = ModelEngine.consensus(models);
+    const mainModels = models.filter(mod => !mod.is_ai_agent);
+    const aiAgent  = models.find(mod => mod.is_ai_agent);
+
     document.getElementById('drawer-body').innerHTML = `
       <div class="sub-label">Siegwahrscheinlichkeit</div>
       <div class="prob3">
@@ -1295,38 +1646,38 @@ const Drawer = {
         </div>
       </div>
 
-      <div class="sub-label">Modell-Metriken</div>
-      <div class="detail-grid">
-        <div class="dg-cell">
-          <div class="dg-label">Favorit</div>
-          <div class="dg-val">${m.leadLabel} <span style="color:var(--lime)">${m.leadProb}%</span></div>
+      ${ktipp ? `
+      <div class="sub-label">Kicktipp-Empfehlung</div>
+      <div class="ktipp-box">
+        <div class="ktipp-score">${ktipp.score}</div>
+        <div class="ktipp-info">
+          <div class="ktipp-label">⚽ Konsens-Tipp · ${ktipp.backing_models.join(', ')}</div>
+          <div class="ktipp-sub">${ktipp.reason}</div>
         </div>
-        <div class="dg-cell">
-          <div class="dg-label">Stärke Heim / Auswärts</div>
-          <div class="dg-val">${m.homeStrength??'–'} / ${m.awayStrength??'–'}</div>
-        </div>
+      </div>` : ''}
+
+      <div class="sub-label">Modellvergleich</div>
+      <div class="model-grid">
+        ${mainModels.map(mod => this._modelCardHtml(mod)).join('')}
       </div>
+
+      ${aiAgent ? `
+      <div class="ai-agent-box">
+        <div class="ai-agent-head">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.2"/>
+            <circle cx="6" cy="6" r="1.5" fill="currentColor"/>
+            <path d="M6 1.5V3M6 9v1.5M1.5 6H3M9 6h1.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+          </svg>
+          AI Agent
+          <span class="ai-agent-status">${aiAgent.model_version === 'preview' ? 'Vorschau' : 'LIVE'}</span>
+        </div>
+        <div class="ai-agent-text">${aiAgent.summary_reason}</div>
+        ${aiAgent.main_score_tip ? `<div style="margin-top:7px;font-size:11px;color:var(--t-muted)">Tipp: <strong style="color:var(--sky)">${aiAgent.main_score_tip}</strong> · K: ${aiAgent.confidence_score}%</div>` : ''}
+      </div>` : ''}
 
       <div class="sub-label">Risiko-Analyse</div>
       <div class="rtag-wrap">${riskHtml}</div>
-
-      ${m.aiReason ? `
-      <div class="ai-box">
-        <div class="ai-box-head">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-            <circle cx="6" cy="6" r="5" stroke="currentColor" stroke-width="1.3"/>
-            <path d="M6 3.5v2.5l1.5 1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-          </svg>
-          Warum ist ${m.leadLabel} Favorit?
-        </div>
-        <div class="ai-box-text">${m.aiReason}</div>
-      </div>` : ''}
-
-      ${m.analysisText ? `
-      <div class="ai-box neutral">
-        <div class="ai-box-head">📊 Kurzanalyse</div>
-        <div class="ai-box-text" style="font-style:italic">${m.analysisText}</div>
-      </div>` : ''}
 
       <div class="conf-row">
         <div class="conf-label">Konfidenz</div>
@@ -1343,6 +1694,43 @@ const Drawer = {
     dr.addEventListener('touchstart', e => { ty0 = e.touches[0].clientY; }, {passive:true, once:true});
     dr.addEventListener('touchmove',  e => { if (e.touches[0].clientY - ty0 > 70) Drawer.close(); }, {passive:true, once:true});
   },
+
+  /** Renders a single model card HTML */
+  _modelCardHtml(mod) {
+    const confCls = mod.confidence_score >= 65 ? 'high' : mod.confidence_score >= 45 ? 'mid' : 'low';
+    const factorsHtml = mod.factors_used.map(f => `<span class="mrf">${f}</span>`).join('');
+    return `
+      <div class="model-card${mod.model_key==='ensemble'?' is-ensemble':''}">
+        <div class="model-head">
+          <div class="model-icon ${mod.icon_class}">${this._modelEmoji(mod.model_key)}</div>
+          <div class="model-name">${mod.model_name}</div>
+          <div class="model-version">v${mod.model_version}</div>
+        </div>
+        <div class="model-tips">
+          <div class="model-tip-cell">
+            <div class="mtc-label">Haupttipp</div>
+            <div class="mtc-val tip-main">${mod.main_score_tip}</div>
+          </div>
+          <div class="model-tip-cell">
+            <div class="mtc-label">Alternative</div>
+            <div class="mtc-val tip-alt">${mod.alt_score_tip}</div>
+          </div>
+          <div class="model-tip-cell">
+            <div class="mtc-label">Konfidenz</div>
+            <div class="mtc-val tip-conf ${confCls}">${mod.confidence_score}%</div>
+          </div>
+        </div>
+        <div class="model-reason">
+          ${mod.summary_reason}
+          <div class="model-reason-factors">${factorsHtml}</div>
+        </div>
+      </div>`;
+  },
+
+  _modelEmoji(key) {
+    return { ensemble:'⚡', elo:'📊', poisson:'📈', dc:'🔬', market:'💹', ai_agent:'🤖' }[key] ?? '◆';
+  },
+
   close() {
     document.getElementById('drawer-overlay').classList.remove('open');
     document.body.style.overflow = '';
