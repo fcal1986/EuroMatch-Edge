@@ -56,6 +56,26 @@ const State = {
   ────────────────────────────────────────────────────────────── */
   modelRankings: [],
 
+  /* ── History ─────────────────────────────────────────────────
+     historyDays:        [{match_date, match_count, hit_rate, …}]
+                         Geladen von v_history_days — einmalig.
+                         Sortiert nach match_date DESC.
+     historySelectedDay: 'YYYY-MM-DD' — ausgewählter Tag.
+     historyMatches:     HistoryRow[] — Spiele des gewählten Tages.
+     historyFilter:      competition_code oder 'ALL'.
+  ────────────────────────────────────────────────────────────── */
+  historyDays:         [],
+  historySelectedDay:  null,
+  historyMatches:      [],
+  historyFilter:       'ALL',
+
+  filteredHistory() {
+    // Liga-Filter wird in History._loadDay() serverseitig angewendet.
+    // Diese Methode bleibt für eventuelle clientseitige Nutzung.
+    if (this.historyFilter === 'ALL') return this.historyMatches;
+    return this.historyMatches.filter(h => h.competition_code === this.historyFilter);
+  },
+
   /* ── Methods ─────────────────────────────────────────────────── */
 
   filtered() {

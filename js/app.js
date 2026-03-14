@@ -132,6 +132,34 @@ const App = {
   },
 
   _applyFilters() { Render.matches(State.filtered()); },
+
+  /* ── Tab navigation ──────────────────────────────────────────
+     'forecast' = Hauptseite (aktuelle Spiele)
+     'history'  = Historische Prognosen
+  ────────────────────────────────────────────────────────────── */
+  switchTab(tab) {
+    const isForecast = tab === 'forecast';
+
+    // Toggle page visibility
+    document.querySelector('.page:not(.page-history)').style.display = isForecast ? '' : 'none';
+    document.getElementById('page-history').style.display            = isForecast ? 'none' : '';
+
+    // Toggle header elements only relevant to forecast view
+    const headerDate   = document.getElementById('header-date');
+    const headerSearch = document.getElementById('header-search');
+    const btnRefresh   = document.getElementById('btn-refresh');
+    const dataBadge    = document.getElementById('data-badge');
+    [headerDate, headerSearch, btnRefresh, dataBadge].forEach(el => {
+      if (el) el.style.display = isForecast ? '' : 'none';
+    });
+
+    // Active tab styling
+    document.getElementById('tab-forecast').classList.toggle('active', isForecast);
+    document.getElementById('tab-history').classList.toggle('active', !isForecast);
+
+    // Lazy-load history on first visit
+    if (!isForecast) History.init();
+  },
 };
 
 /* ── Boot ────────────────────────────────────────────────────── */
