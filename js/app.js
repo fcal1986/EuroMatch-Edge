@@ -52,12 +52,15 @@ const App = {
     });
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape') {
-        Drawer.close();
-        searchInput.value = '';
-        searchWrap.classList.remove('expanded');
-        State.searchQuery = '';
-        localStorage.setItem('eme_search', '');
-        this._applyFilters();
+        // Drawer manages its own Escape handler internally.
+        // Here: only clear the search if drawer is NOT open.
+        if (!Drawer._isOpen) {
+          searchInput.value = '';
+          searchWrap.classList.remove('expanded');
+          State.searchQuery = '';
+          localStorage.setItem('eme_search', '');
+          this._applyFilters();
+        }
       }
     });
 

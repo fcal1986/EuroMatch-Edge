@@ -13,6 +13,10 @@
 ────────────────────────────────────────────────────────────────── */
 const Drawer = {
 
+  _isOpen: false,          // interner State — Source of Truth
+  _escHandler: null,       // Escape-Key Handler (cleanup on close)
+  _scrollY: 0,             // Scroll-Position vor Lock (iOS fix)
+
   open(id) {
     const m = State.allMatches.find(x => x.id === id);
     if (!m) return;
@@ -54,36 +58,101 @@ const Drawer = {
       (aiAgent ? this._sectionAIAgent(aiAgent) : '') +
       this._sectionRisk(riskHtml, m);
 
+    // Scroll-Position merken und Body locken (iOS-safe)
+    this._scrollY = window.scrollY;
+    document.body.style.overflow    = 'hidden';
+    document.body.style.position    = 'fixed';
+    document.body.style.top         = `-${this._scrollY}px`;
+    document.body.style.width       = '100%';
+
+    // Overlay öffnen
     document.getElementById('drawer-overlay').classList.add('open');
-    document.body.style.overflow = 'hidden';
+    this._isOpen = true;
+
+    // Escape schließt Drawer
+    this._escHandler = (e) => { if (e.key === 'Escape') this.close(); };
+    document.addEventListener('keydown', this._escHandler);
 
     // Swipe-Down auf Handle/Header schließt Drawer.
-    // Läuft nur auf dem nicht-scrollbaren Bereich (drawer-handle, drawer-head),
-    // damit Scroll im drawer-body nicht fälschlich das Schließen triggert.
+    // NUR auf Handle + Head — nicht auf scrollbarem Body.
     const dr       = document.getElementById('drawer');
     const drHandle = dr.querySelector('.drawer-handle');
     const drHead   = dr.querySelector('.drawer-head');
 
-    const startSwipe = e => {
-      e._swipeStartY = e.touches[0].clientY;
+    let swipeStartY = 0;
+
+    const onTouchStart = (e) => {
+      swipeStartY = e.touches[0].clientY;
     };
-    const moveSwipe = e => {
-      const delta = e.touches[0].clientY - e._swipeStartY;
-      if (delta === undefined) return;
-      if (delta > 70) Drawer.close();
+    const onTouchMove = (e) => {
+      const delta = e.touches[0].clientY - swipeStartY;
+      if (delta > 70) this.close();
     };
 
     [drHandle, drHead].forEach(el => {
       if (!el) return;
-      el.addEventListener('touchstart', startSwipe, { passive: true, once: true });
-      el.addEventListener('touchmove',  moveSwipe,  { passive: true, once: true });
+      el.addEventListener('touchstart', onTouchStart, { passive: true, once: true });
+      el.addEventListener('touchmove',  onTouchMove,  { passive: true, once: true });
     });
   },
 
   close() {
+    if (!this._isOpen) return;   // Idempotent — kein Doppel-Close
+
     document.getElementById('drawer-overlay').classList.remove('open');
+    this._isOpen = false;
+
+    // Escape Handler entfernen
+    if (this._escHandler) {
+      document.removeEventListener('keydown', this._escHandler);
+      this._escHandler = null;
+    }
+
+    // Body-Lock aufheben und Scroll-Position wiederherstellen (iOS-safe)
     document.body.style.overflow = '';
+    document.body.style.position = '';
+    document.body.style.top      = '';
+    document.body.style.width    = '';
+    window.scrollTo(0, this._scrollY);
   },
+    if (!m) return;
+
+    const homeWin = m.predictedWinner === 'home';
+    const awayWin = m.predictedWinner === 'away';
+    const [bCls, bLabel] = badgeInfo(m);
+
+    // Wochentag aus kickoffAt berechnen (de-DE, z.B. "Samstag")
+    const weekday = m.kickoffAt
+      ? m.kickoffAt.toLocaleDateString('de-DE', { weekday: 'long' })
+      : '';
+
+    document.getElementById('drawer-league').innerHTML =
+      `${weekday ? `<span class="dh-weekday">${weekday}</span><span class="dh-sep">·</span>` : ''}` +
+      `${m.flag} <span>${m.competitionName}</span>` +
+      `<span class="dh-sep">·</span><span class="dh-time">${fmtTime(m.kickoffAt)} Uhr</span>`;
+    document.getElementById('dh-teams').textContent =
+      `${m.homeTeam}  ×  ${m.awayTeam}`;
+    document.getElementById('dh-tags').innerHTML =
+      `<span class="badge ${bCls}">${bLabel}</span>` +
+      m.riskTags.map(t => `<span class="rtag">${t}</span>`).join('');
+
+    // Run models (cached if available from earlier open)
+    const models     = State.modelsByMatch[m.id] || ModelEngine.run(m);
+    const ktipp      = ModelEngine.consensus(models);
+    const mainModels = ModelEngine.mainModels(models);
+    const aiAgent    = ModelEngine.agentResult(models);
+
+    const riskHtml = m.riskTags.length
+      ? m.riskTags.map(t => `<span class="rtag-d">${t}</span>`).join('')
+      : '<span class="rtag-ok">✓ Keine Risiken erkannt</span>';
+
+    document.getElementById('drawer-body').innerHTML =
+      this._sectionProb(m, homeWin, awayWin) +
+      this._sectionStrengthForm(m) +
+      (ktipp ? this._sectionKtipp(ktipp) : '') +
+      this._sectionModelGrid(mainModels) +
+      (aiAgent ? this._sectionAIAgent(aiAgent) : '') +
+      this._sectionRisk(riskHtml, m);
 
   /* ── Section renderers ──────────────────────────────────────── */
 
