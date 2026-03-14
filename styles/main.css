@@ -669,3 +669,253 @@ footer { border-top: 1px solid var(--border); padding: 14px var(--sp-md); font-s
   font-size: 10px; font-weight: 700; color: var(--t-muted);
   width: 28px; text-align: right; flex-shrink: 0;
 }
+
+/* ══════════════════════════════════════════════════════════════
+   NAVIGATION TABS
+   Sitzt zwischen Logo und Header-Date in der Sticky-Headerleiste.
+   Zwei Tabs: Prognosen | Verlauf
+══════════════════════════════════════════════════════════════ */
+.nav-tabs {
+  display: flex;
+  gap: 3px;
+  background: var(--bg-3);
+  border-radius: var(--r-pill);
+  padding: 3px;
+  flex-shrink: 0;
+}
+.nav-tab {
+  background: transparent;
+  border: none;
+  border-radius: var(--r-pill);
+  color: var(--t-secondary);
+  cursor: pointer;
+  font-family: var(--f-body);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 13px;
+  transition: background .15s, color .15s;
+  white-space: nowrap;
+}
+.nav-tab:hover  { background: var(--bg-4); color: var(--t-primary); }
+.nav-tab.active { background: var(--lime); color: var(--t-invert); }
+
+@media (max-width: 480px) {
+  .nav-tab { font-size: 11px; padding: 4px 9px; }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   HISTORY PAGE — Lade-Indikator
+══════════════════════════════════════════════════════════════ */
+.hist-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: var(--sp-md) var(--sp-md);
+  color: var(--t-secondary);
+  font-size: 13px;
+}
+.hist-spinner {
+  width: 16px; height: 16px;
+  border: 2px solid var(--border-md);
+  border-top-color: var(--lime);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ══════════════════════════════════════════════════════════════
+   HISTORY ROW — Erweiterung des match-row Schemas
+   Fügt Prognose-/Ergebnis-Spalte und Outcome-Badge hinzu.
+══════════════════════════════════════════════════════════════ */
+.hist-row { cursor: default; }    /* kein Drawer in der Historien-Ansicht */
+
+/* Score-Zellen (Prognose → Ergebnis) */
+.hist-scores {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+}
+.hist-score-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.hist-score-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .5px;
+  text-transform: uppercase;
+  color: var(--t-muted);
+}
+.hist-pred {
+  font-family: var(--f-display);
+  font-size: 17px;
+  font-weight: 800;
+  color: var(--t-secondary);
+  line-height: 1;
+}
+.hist-actual {
+  font-family: var(--f-display);
+  font-size: 17px;
+  font-weight: 900;
+  line-height: 1;
+}
+.hist-score-sep {
+  font-size: 13px;
+  color: var(--t-muted);
+  padding-top: 14px;   /* align with numbers, not labels */
+}
+
+/* Actual score colour per outcome */
+.hist-actual.outcome-exact     { color: var(--lime); }
+.hist-actual.outcome-goal-diff { color: var(--green); }
+.hist-actual.outcome-tendency  { color: var(--amber); }
+.hist-actual.outcome-wrong     { color: var(--red); }
+
+/* Left border tint per outcome */
+.outcome-row-exact     { border-left: 3px solid var(--lime) !important; }
+.outcome-row-goal-diff { border-left: 3px solid var(--green) !important; }
+.outcome-row-tendency  { border-left: 3px solid var(--amber) !important; }
+.outcome-row-wrong     { border-left: 3px solid var(--red) !important; }
+
+/* Right column in history rows */
+.hist-outcome-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+  min-width: 120px;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   OUTCOME BADGE
+   Grün = exakt, Grün-gedimmt = Tordiff, Gelb = Tendenz, Rot = falsch
+══════════════════════════════════════════════════════════════ */
+.outcome-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: var(--r-pill);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 9px;
+  white-space: nowrap;
+  letter-spacing: .3px;
+}
+.outcome-badge .outcome-icon  { font-size: 12px; line-height: 1; }
+.outcome-badge .outcome-label { font-size: 10px; }
+
+.outcome-badge.outcome-exact {
+  background: var(--lime-dim);
+  color: var(--lime);
+  border: 1px solid var(--lime-border);
+}
+.outcome-badge.outcome-goal-diff {
+  background: rgba(52,211,153,.10);
+  color: var(--green);
+  border: 1px solid rgba(52,211,153,.25);
+}
+.outcome-badge.outcome-tendency {
+  background: var(--amber-dim);
+  color: var(--amber);
+  border: 1px solid rgba(255,170,0,.25);
+}
+.outcome-badge.outcome-wrong {
+  background: var(--red-dim);
+  color: var(--red);
+  border: 1px solid rgba(255,59,85,.2);
+}
+
+/* Confidence below badge */
+.hist-conf {
+  font-size: 10px;
+  color: var(--t-muted);
+  font-weight: 600;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   HISTORY KPI STRIP — 5-spaltig (überschreibt die 4-spaltige
+   Regel der Hauptseite nur für die History-Seite)
+══════════════════════════════════════════════════════════════ */
+.page-history .kpi-strip {
+  grid-template-columns: repeat(5, 1fr);
+}
+@media (max-width: 700px) {
+  .page-history .kpi-strip {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+@media (max-width: 420px) {
+  .page-history .kpi-strip {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   HISTORY DAY NAVIGATION BAR
+   ◀  Dienstag, 15. Apr. 2025  ·  8 Spiele · 62% Treffer  ▶
+══════════════════════════════════════════════════════════════ */
+.hist-nav-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-sm);
+  padding: var(--sp-sm) var(--sp-md);
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 56px;     /* below the header */
+  z-index: 100;
+}
+.hist-nav-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px; height: 34px;
+  border-radius: var(--r-sm);
+  background: var(--bg-3);
+  color: var(--t-secondary);
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+  transition: background .15s, color .15s, opacity .15s;
+}
+.hist-nav-btn:hover:not(:disabled) {
+  background: var(--bg-4);
+  color: var(--t-primary);
+  border-color: var(--border-md);
+}
+.hist-nav-btn:disabled { opacity: .35; cursor: default; }
+
+.hist-nav-center {
+  flex: 1;
+  text-align: center;
+  min-width: 0;
+}
+.hist-nav-date {
+  font-family: var(--f-display);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--t-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hist-nav-sub {
+  font-size: 11px;
+  color: var(--t-muted);
+  margin-top: 1px;
+}
+
+/* ── History KPI: 6-spaltig ─────────────────────────────── */
+.page-history .kpi-strip {
+  grid-template-columns: repeat(6, 1fr);
+}
+@media (max-width: 900px) {
+  .page-history .kpi-strip { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 480px) {
+  .page-history .kpi-strip { grid-template-columns: repeat(2, 1fr); }
+  .hist-nav-date { font-size: 13px; }
+}
