@@ -511,6 +511,11 @@ a { color: inherit; text-decoration: none; }
    DETAIL DRAWER
    Mobile (<640px): Bottom Sheet von unten, Höhe 92dvh.
    Desktop (≥640px): zentriertes Modal, natürliche Höhe.
+
+   WICHTIG: .overlay liegt direkt in <body>, nicht in einem
+   Container mit transform/filter/overflow. position:fixed
+   bezieht sich auf den Viewport, nicht den nächsten
+   positioned Ancestor.
 ══════════════════════════════════════════════════════════════ */
 
 /* ── Overlay / Backdrop ─────────────────────────────────────── */
@@ -519,14 +524,14 @@ a { color: inherit; text-decoration: none; }
   inset: 0;
   z-index: 300;
   background: rgba(0,0,0,0.72);
-  /* backdrop-filter ENTFERNT: erzeugt Stacking Context der
-     z-index aller Kinder bricht und Klicks auf Header blockiert */
+  /* KEIN backdrop-filter: würde neuen Stacking Context erzeugen
+     und z-index von Header/Suche brechen */
   display: flex;
   align-items: flex-end;
   justify-content: center;
-  /* Geschlossen: unsichtbar UND keine Pointer-Events */
+  /* Geschlossen: komplett inaktiv */
   opacity: 0;
-  visibility: hidden;       /* Zusätzlich zu pointer-events — Safari-Fix */
+  visibility: hidden;
   pointer-events: none;
   transition: opacity .25s, visibility .25s;
 }
@@ -536,20 +541,26 @@ a { color: inherit; text-decoration: none; }
   pointer-events: all;
 }
 
-/* ── Drawer (Mobile Bottom Sheet) ───────────────────────────── */
+/* ── Drawer Sheet ────────────────────────────────────────────── */
 .drawer {
   background: var(--bg-1);
   width: 100%;
   max-width: 640px;
 
-  /* Mobile: feste Höhe damit overflow-y:auto im Body wirkt */
+  /*
+   * Höhe: dvh (Dynamic Viewport Height) berücksichtigt
+   * Browser-Chrome auf Mobile (URL-Bar, Nav-Bar).
+   * svh-Fallback für ältere Browser die dvh nicht kennen.
+   * 92% lässt den Hintergrund sichtbar (echtes Sheet-Gefühl).
+   */
+  height: 92svh;
   height: 92dvh;
   max-height: 92dvh;
 
   border-radius: 20px 20px 0 0;
   border-top: 1px solid var(--border-md);
 
-  /* Flex-Column: Handle + Head fixed oben, Body scrollt */
+  /* Flex-Column: Handle + Head fix oben, Body scrollt */
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -571,26 +582,12 @@ a { color: inherit; text-decoration: none; }
 
 /* ── Header ──────────────────────────────────────────────────── */
 .drawer-head {
-  padding: 12px 52px 14px 18px;  /* rechts: Platz für Close-Button */
+  padding: 12px 52px 14px 18px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-1);
   flex-shrink: 0;
-  position: relative;             /* Für .drawer-close absolut */
+  position: relative;
 }
-
-/* ── Scrollbarer Body ────────────────────────────────────────── */
-.drawer-body {
-  flex: 1;
-  overflow-y: auto;
-  overflow-x: hidden;
-  overscroll-behavior: contain;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: none;
-  min-height: 0;                  /* Safari flex bug fix */
-  padding: 18px;
-  box-sizing: border-box;
-}
-.drawer-body::-webkit-scrollbar { display: none; }
 
 /* ── Schließen-Button ────────────────────────────────────────── */
 .drawer-close {
@@ -609,11 +606,24 @@ a { color: inherit; text-decoration: none; }
 .drawer-close:hover { background: var(--bg-4); }
 .drawer-close svg   { display: block; pointer-events: none; }
 
+/* ── Scrollbarer Body ────────────────────────────────────────── */
+.drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  min-height: 0;
+  padding: 18px;
+  box-sizing: border-box;
+}
+.drawer-body::-webkit-scrollbar { display: none; }
+
 /* ── Desktop Modal (≥640px) ──────────────────────────────────── */
 @media (min-width: 640px) {
   .overlay { align-items: center; }
   .drawer {
-    /* !important: überschreibt mobile height:92dvh sicher */
     height: auto !important;
     max-height: 88dvh;
     border-radius: 16px;
