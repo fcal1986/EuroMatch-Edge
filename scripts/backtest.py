@@ -38,6 +38,12 @@ Aufruf:
   python backtest.py --dry-run
 """
 
+# ARCHITEKTUR-HINWEIS:
+# model_results ist die Evaluation-/Backtest-Tabelle dieses Projekts.
+# Sie speichert Predictions GEGEN tatsächliche Ergebnisse und ist damit
+# das Äquivalent zu "prediction_evaluations" aus anderen Systemen.
+# Eine separate prediction_evaluations-Tabelle existiert nicht.
+
 import os
 import sys
 import json
@@ -49,6 +55,18 @@ from urllib.parse import urlencode
 
 import requests
 from dotenv import load_dotenv
+
+# Runtime Metadata Layer
+try:
+    from utils.runtime_metadata import (
+        get_system_version, start_pipeline_run, finish_pipeline_run,
+        register_system_release,
+    )
+except ImportError:
+    def get_system_version(): return "dev"
+    def start_pipeline_run(j, **kw): return "no-run-id"
+    def finish_pipeline_run(r, **kw): pass
+    def register_system_release(**kw): pass
 
 load_dotenv()
 
@@ -66,6 +84,14 @@ SERVICE_ROLE_KEY  = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_API_KEY", "")
 
 TABLE = "model_results"
+
+# ── Modell-Versionen ─────────────────────────────────────────
+# Bump these when the corresponding logic changes.
+# Must match what compute_predictions.py uses when possible.
+# Can be overridden via ENV for controlled rollouts.
+MODEL_VERSION       = os.environ.get("MODEL_VERSION",       "1.0")
+CALIBRATION_VERSION = os.environ.get("CALIBRATION_VERSION", "1.0")
+WEIGHTS_VERSION     = os.environ.get("WEIGHTS_VERSION",     "1.0")
 
 HEADERS_READ = {
     "apikey":        SERVICE_ROLE_KEY,
@@ -628,6 +654,16 @@ def run_backtest(
     log.info("  season      : %s", season or "latest")
     log.info("  dry_run     : %s", dry_run)
 
+    _sys_version = get_system_version()
+    _run_id      = start_pipeline_run(
+        "backtest",
+        system_version=_sys_version,
+        metadata={"season": season, "competition": competition, "dry_run": dry_run},
+    )
+    register_system_release()
+    log.info("  version     : %s", _sys_version)
+    log.info("  run_id      : %s", _run_id)
+
     matches = fetch_finished_matches(season=season, competition=competition)
     log.info("Fetched %d finished matches", len(matches))
 
@@ -664,7 +700,9 @@ def run_backtest(
             rows.append({
                 "match_id":           m["id"],
                 "model_key":          model_key,
-                "model_version":      "1.0",
+                "model_version":      MODEL_VERSION,
+                "calibration_version": CALIBRATION_VERSION,
+                "weights_version":     WEIGHTS_VERSION,
                 # Prognose
                 "predicted_score":    result["predicted_score"],
                 "predicted_winner":   result["predicted_winner"],
@@ -685,6 +723,9 @@ def run_backtest(
                 "competition_code":   m.get("competition_code", ""),
                 "season":             m.get("season", season or ""),
                 "kickoff_at":         m.get("kickoff_at"),
+                # Versioning — filled below after pipeline_run_id is known:
+                "system_version":  None,
+                "pipeline_run_id": None,
             })
 
     if skipped:
@@ -692,6 +733,11 @@ def run_backtest(
 
     log.info("Computed %d predictions (%d matches × %d models)",
              len(rows), len(matches) - skipped, len(MODELS))
+
+    # Inject versioning metadata
+    for r in rows:
+        r["system_version"]  = _sys_version
+        r["pipeline_run_id"] = _run_id
 
     if dry_run:
         log.info("DRY RUN — no Supabase write")
@@ -713,6 +759,11 @@ def run_backtest(
         upsert_results(rows)
 
     log.info("── Backtest done ───────────────────────────────────")
+    finish_pipeline_run(
+        _run_id,
+        status="success" if not dry_run else "dry_run",
+        metadata={"rows_written": len(rows), "skipped": skipped},
+    )
 
 
 if __name__ == "__main__":

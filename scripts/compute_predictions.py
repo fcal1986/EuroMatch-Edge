@@ -27,6 +27,25 @@ from typing import Any
 
 import requests
 
+# Runtime Metadata Layer
+try:
+    from utils.runtime_metadata import (
+        get_system_version, start_pipeline_run, finish_pipeline_run,
+        register_system_release,
+    )
+    _METADATA_AVAILABLE = True
+except ImportError:
+    # Fallback: metadata layer nicht verfügbar (z.B. beim direkten Aufruf ohne utils)
+    import logging as _log
+    _log.getLogger(__name__).warning(
+        "utils.runtime_metadata not found — versioning disabled."
+    )
+    def get_system_version(): return "dev"
+    def start_pipeline_run(j, **kw): return "no-run-id"
+    def finish_pipeline_run(r, **kw): pass
+    def register_system_release(**kw): pass
+    _METADATA_AVAILABLE = False
+
 # ─────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────
@@ -43,7 +62,9 @@ log = logging.getLogger(__name__)
 # MODEL CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-MODEL_VERSION = "1.0"
+MODEL_VERSION        = "1.0"
+CALIBRATION_VERSION  = "1.0"   # bump when calibration is retrained
+WEIGHTS_VERSION      = "1.0"   # bump when WEIGHTS dict changes
 
 # Minimum win_probability to be flagged as a strong tip
 STRONG_TIP_THRESHOLD = 70
@@ -165,6 +186,15 @@ class SupabaseClient:
     def upsert_predictions(self, rows: list[dict[str, Any]]) -> None:
         """
         UPSERT prediction rows on conflict key `match_id`.
+
+        BEWUSSTE ENTSCHEIDUNG — Konfliktschlüssel ist nur match_id:
+          Die tägliche Pipeline überschreibt immer den neuesten Prognosestand
+          pro Match. Historische Versionen werden NICHT retained.
+          Begründung: upcoming matches werden täglich neu berechnet;
+          "latest prediction wins" ist das gewünschte Verhalten.
+          Für Multi-Version-History müsste der Schlüssel auf
+          (match_id, model_version) oder (match_id, pipeline_run_id)
+          umgestellt werden — geplant für Model Governance Agent v2.
 
         PostgREST requires two things for a true upsert:
           1. ?on_conflict=match_id  — tells PostgREST which column to conflict on
@@ -493,7 +523,12 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         "risk_tags":        risk_tags,
         "analysis_text":    analysis_text,
         "ai_reason":        ai_reason,
-        "model_version":    MODEL_VERSION,
+        "model_version":        MODEL_VERSION,
+        "calibration_version":  CALIBRATION_VERSION,
+        "weights_version":       WEIGHTS_VERSION,
+        # Filled by run() after pipeline_run_id is known:
+        "system_version":        None,
+        "pipeline_run_id":       None,
     }
 
 
@@ -661,6 +696,17 @@ def run(days_ahead: int, dry_run: bool) -> None:
     log.info("Model    : v%s", MODEL_VERSION)
     log.info("═══════════════════════════════════════════════")
 
+    # ── Metadata tracking ──────────────────────────────────
+    _sys_version = get_system_version()
+    _run_id      = start_pipeline_run(
+        "compute_predictions",
+        system_version=_sys_version,
+        metadata={"days_ahead": days_ahead, "dry_run": dry_run},
+    )
+    register_system_release()
+    log.info("Version    : %s", _sys_version)
+    log.info("Run ID     : %s", _run_id)
+
     supabase_url, service_key = load_env()
     sb = SupabaseClient(supabase_url, service_key)
 
@@ -725,6 +771,11 @@ def run(days_ahead: int, dry_run: bool) -> None:
 
     log.info("─── Computed %d / %d prediction(s).", len(predictions), len(matches))
 
+    # ── Inject versioning metadata into all prediction rows
+    for p in predictions:
+        p["system_version"]  = _sys_version
+        p["pipeline_run_id"] = _run_id
+
     # ── Upsert
     if dry_run:
         log.info("[DRY RUN] Would upsert %d row(s).", len(predictions))
@@ -756,10 +807,16 @@ def run(days_ahead: int, dry_run: bool) -> None:
     if compute_errors and len(compute_errors) == len(matches):
         log.error("  All predictions failed.")
         log.info("═══════════════════════════════════════════════")
+        finish_pipeline_run(_run_id, status="failed",
+            metadata={"errors": compute_errors})
         sys.exit(1)
 
     log.info("  Status             : SUCCESS")
+    log.info("  System version     : %s", _sys_version)
+    log.info("  Pipeline run ID    : %s", _run_id)
     log.info("═══════════════════════════════════════════════")
+    finish_pipeline_run(_run_id, status="success",
+        metadata={"predictions": len(predictions), "errors": len(compute_errors)})
 
 
 def main() -> None:
