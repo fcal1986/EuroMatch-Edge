@@ -78,6 +78,19 @@ logging.basicConfig(
 )
 log = logging.getLogger("backtest")
 
+# Evaluation Metrics Layer
+try:
+    from utils.eval_metrics import (
+        compute_eval_metrics,
+        probs_from_score_grid,
+        probs_from_home_probability,
+    )
+except ImportError:
+    log.warning("utils.eval_metrics not found — extended metrics disabled.")
+    def compute_eval_metrics(*a, **kw): return {}
+    def probs_from_score_grid(g): return (None, None, None)
+    def probs_from_home_probability(p): return (None, None, None)
+
 # ── Config from environment ───────────────────────────────────
 SUPABASE_URL      = os.environ["SUPABASE_URL"]
 SERVICE_ROLE_KEY  = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -286,8 +299,10 @@ def ensemble(m: dict) -> dict:
     hg       = 1.2 + diff * 1.5 + form_adv * 0.5
     ag       = 0.7 - diff * 0.8 + (1 - form_adv) * 0.3
     main_tip = f"{max(0, round(hg))}:{max(0, round(ag))}"
+    _ph, _pd, _pa = probs_from_home_probability(home_p)
     return {"predicted_winner": winner, "predicted_score": main_tip,
-            "confidence_score": min(99, conf)}
+            "confidence_score": min(99, conf),
+            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
 @register_model
@@ -302,8 +317,10 @@ def poisson(m: dict) -> dict:
     top    = top_scores(grid, 1)
     main_tip = top[0][0] if top else f"{round(lh)}:{round(la)}"
     conf   = int(min(85, top[0][1] * 100 * 2.5)) if top else 50
+    _ph, _pd, _pa = probs_from_score_grid(grid)
     return {"predicted_winner": winner, "predicted_score": main_tip,
-            "confidence_score": conf}
+            "confidence_score": conf,
+            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
 @register_model
@@ -319,8 +336,10 @@ def dc(m: dict) -> dict:
     top    = top_scores(grid, 1)
     main_tip = top[0][0] if top else f"{round(lh)}:{round(la)}"
     conf   = int(min(85, top[0][1] * 100 * 2.5)) if top else 50
+    _ph, _pd, _pa = probs_from_score_grid(grid)
     return {"predicted_winner": winner, "predicted_score": main_tip,
-            "confidence_score": conf}
+            "confidence_score": conf,
+            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
 @register_model
@@ -332,8 +351,10 @@ def elo(m: dict) -> dict:
     hg     = 1.0 + diff * 1.8
     ag     = 0.9 - diff * 0.9
     main_tip = f"{max(0, round(hg))}:{max(0, round(ag))}"
+    _ph, _pd, _pa = probs_from_home_probability(home_p)
     return {"predicted_winner": winner, "predicted_score": main_tip,
-            "confidence_score": min(99, conf)}
+            "confidence_score": min(99, conf),
+            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
 @register_model
@@ -347,8 +368,10 @@ def market(m: dict) -> dict:
     hg      = 0.9 + diff * 1.2
     ag      = 0.8 - diff * 0.6
     main_tip = f"{max(0, round(hg))}:{max(0, round(ag))}"
+    _ph, _pd, _pa = probs_from_home_probability(implied)
     return {"predicted_winner": winner, "predicted_score": main_tip,
-            "confidence_score": min(90, conf)}
+            "confidence_score": min(90, conf),
+            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -664,131 +687,145 @@ def run_backtest(
     log.info("  version     : %s", _sys_version)
     log.info("  run_id      : %s", _run_id)
 
-    try:
-        matches = fetch_finished_matches(season=season, competition=competition)
-        log.info("Fetched %d finished matches", len(matches))
+    matches = fetch_finished_matches(season=season, competition=competition)
+    log.info("Fetched %d finished matches", len(matches))
 
-        if not matches:
-            log.warning("No finished matches found — nothing to do.")
-            finish_pipeline_run(
-                _run_id,
-                status="success",
-                metadata={
-                    "rows_written": 0,
-                    "skipped": 0,
-                    "reason": "no_finished_matches",
-                    "dry_run": dry_run,
-                },
-            )
-            return
+    if not matches:
+        log.warning("No finished matches found — nothing to do.")
+        return
 
-        rows: list[dict] = []
-        skipped = 0
+    rows: list[dict] = []
+    skipped = 0
 
-        for m in matches:
-            actual_h = m.get("actual_home_goals")
-            actual_a = m.get("actual_away_goals")
-            if actual_h is None or actual_a is None:
-                skipped += 1
+    for m in matches:
+        actual_h = m.get("actual_home_goals")
+        actual_a = m.get("actual_away_goals")
+        if actual_h is None or actual_a is None:
+            skipped += 1
+            continue
+
+        actual_score  = f"{actual_h}:{actual_a}"
+        actual_winner = (
+            "home"  if actual_h > actual_a else
+            "away"  if actual_a > actual_h else
+            "draw"
+        )
+
+        for model_key, model_fn in MODELS.items():
+            try:
+                result = model_fn(m)
+            except Exception as exc:
+                log.warning("  [WARN] %s on %s failed: %s", model_key, m.get("id"), exc)
                 continue
 
-            actual_score  = f"{actual_h}:{actual_a}"
-            actual_winner = (
-                "home"  if actual_h > actual_a else
-                "away"  if actual_a > actual_h else
-                "draw"
+            pts     = calc_points(result["predicted_score"], actual_h, actual_a)
+            outcome = calc_outcome_label(result["predicted_score"], actual_h, actual_a)
+
+            # ── Extended evaluation metrics ───────────────────
+            metrics = compute_eval_metrics(
+                predicted_score = result["predicted_score"],
+                actual_home     = actual_h,
+                actual_away     = actual_a,
+                prob_home       = result.get("prob_home"),
+                prob_draw       = result.get("prob_draw"),
+                prob_away       = result.get("prob_away"),
             )
 
-            for model_key, model_fn in MODELS.items():
-                try:
-                    result = model_fn(m)
-                except Exception as exc:
-                    log.warning("  [WARN] %s on %s failed: %s", model_key, m.get("id"), exc)
-                    continue
+            rows.append({
+                "match_id":           m["id"],
+                "model_key":          model_key,
+                "model_version":      MODEL_VERSION,
+                "calibration_version": CALIBRATION_VERSION,
+                "weights_version":     WEIGHTS_VERSION,
+                # Prognose
+                "predicted_score":    result["predicted_score"],
+                "predicted_winner":   result["predicted_winner"],
+                "confidence_score":   result["confidence_score"],
+                # Ergebnis
+                "actual_score":       actual_score,
+                "actual_winner":      actual_winner,
+                "actual_home_goals":  actual_h,
+                "actual_away_goals":  actual_a,
+                # Bewertung (bestehend)
+                "points":             pts,
+                "outcome_label":      outcome,
+                # Evaluation Metrics (neu)
+                "predicted_1x2":      metrics.get("predicted_1x2"),
+                "actual_1x2":         metrics.get("actual_1x2"),
+                "is_exact_hit":       metrics.get("is_exact_hit"),
+                "is_tendency_hit":    metrics.get("is_tendency_hit"),
+                "score_error_abs":    metrics.get("score_error_abs"),
+                "goal_diff_error":    metrics.get("goal_diff_error"),
+                "brier_score_1x2":    metrics.get("brier_score_1x2"),
+                "log_loss_1x2":       metrics.get("log_loss_1x2"),
+                # Spielkontext (denormalisiert für Frontend)
+                "home_team":          m.get("home_team", ""),
+                "away_team":          m.get("away_team", ""),
+                "flag":               m.get("flag", ""),
+                "league_abbr":        m.get("league_abbr", ""),
+                "competition_code":   m.get("competition_code", ""),
+                "season":             m.get("season", season or ""),
+                "kickoff_at":         m.get("kickoff_at"),
+                # Versioning — filled below after pipeline_run_id is known:
+                "system_version":  None,
+                "pipeline_run_id": None,
+            })
 
-                pts     = calc_points(result["predicted_score"], actual_h, actual_a)
-                outcome = calc_outcome_label(result["predicted_score"], actual_h, actual_a)
-                rows.append({
-                    "match_id":            m["id"],
-                    "model_key":           model_key,
-                    "model_version":       MODEL_VERSION,
-                    "calibration_version": CALIBRATION_VERSION,
-                    "weights_version":     WEIGHTS_VERSION,
-                    # Prognose
-                    "predicted_score":     result["predicted_score"],
-                    "predicted_winner":    result["predicted_winner"],
-                    "confidence_score":    result["confidence_score"],
-                    # Ergebnis
-                    "actual_score":        actual_score,
-                    "actual_winner":       actual_winner,
-                    "actual_home_goals":   actual_h,
-                    "actual_away_goals":   actual_a,
-                    # Bewertung
-                    "points":              pts,
-                    "outcome_label":       outcome,
-                    # Spielkontext (denormalisiert für Frontend)
-                    "home_team":           m.get("home_team", ""),
-                    "away_team":           m.get("away_team", ""),
-                    "flag":                m.get("flag", ""),
-                    "league_abbr":         m.get("league_abbr", ""),
-                    "competition_code":    m.get("competition_code", ""),
-                    "season":              m.get("season", season or ""),
-                    "kickoff_at":          m.get("kickoff_at"),
-                    # Versioning — filled below after pipeline_run_id is known:
-                    "system_version":      None,
-                    "pipeline_run_id":     None,
-                })
+    if skipped:
+        log.warning("Skipped %d matches with missing actual goals", skipped)
 
-        if skipped:
-            log.warning("Skipped %d matches with missing actual goals", skipped)
+    log.info("Computed %d predictions (%d matches × %d models)",
+             len(rows), len(matches) - skipped, len(MODELS))
 
-        log.info(
-            "Computed %d predictions (%d matches × %d models)",
-            len(rows),
-            len(matches) - skipped,
-            len(MODELS),
-        )
+    # Inject versioning metadata
+    for r in rows:
+        r["system_version"]  = _sys_version
+        r["pipeline_run_id"] = _run_id
 
+    if dry_run:
+        log.info("DRY RUN — no Supabase write")
+        sample = rows[:3]
+        print(json.dumps(sample, indent=2, default=str))
+
+        # ── Per-model summary (dry run) ───────────────────
+        from collections import defaultdict
+        by_model: dict[str, list] = defaultdict(list)
         for r in rows:
-            r["system_version"]  = _sys_version
-            r["pipeline_run_id"] = _run_id
+            by_model[r["model_key"]].append(r)
 
-        if dry_run:
-            log.info("DRY RUN — no Supabase write")
-            sample = rows[:3]
-            print(json.dumps(sample, indent=2, default=str))
-            from collections import defaultdict
-            by_model: dict = defaultdict(list)
-            for r in rows:
-                by_model[r["model_key"]].append(r["points"])
-            print("\nPoints summary (dry run):")
-            for mk, pts_list in sorted(by_model.items()):
-                n     = len(pts_list)
-                avg   = sum(pts_list) / n if n else 0
-                exact = sum(1 for p in pts_list if p == 4)
-                print(f"  {mk:12s}  n={n:4d}  avg={avg:.2f}  exact={exact}")
-        else:
-            upsert_results(rows)
+        print("\n── Dry-Run Model Summary ─────────────────────")
+        hdr = f"  {'model':<12s}  {'n':>4}  {'avg_pts':>7}  {'tend%':>6}  {'exact%':>6}  {'avg_err':>7}  {'avg_brier':>9}"
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        for mk, rlist in sorted(by_model.items()):
+            n          = len(rlist)
+            avg_pts    = sum(r["points"] for r in rlist) / n if n else 0
+            tend_n     = [r for r in rlist if r.get("is_tendency_hit") is not None]
+            tend_pct   = (sum(1 for r in tend_n if r["is_tendency_hit"]) /
+                          len(tend_n) * 100) if tend_n else float("nan")
+            exact_n    = [r for r in rlist if r.get("is_exact_hit") is not None]
+            exact_pct  = (sum(1 for r in exact_n if r["is_exact_hit"]) /
+                          len(exact_n) * 100) if exact_n else float("nan")
+            err_vals   = [r["score_error_abs"] for r in rlist
+                          if r.get("score_error_abs") is not None]
+            avg_err    = sum(err_vals) / len(err_vals) if err_vals else float("nan")
+            brier_vals = [r["brier_score_1x2"] for r in rlist
+                          if r.get("brier_score_1x2") is not None]
+            avg_brier  = sum(brier_vals) / len(brier_vals) if brier_vals else None
+            brier_str  = f"{avg_brier:9.4f}" if avg_brier is not None else "      n/a"
+            print(
+                f"  {mk:<12s}  {n:>4d}  {avg_pts:7.2f}  "
+                f"{tend_pct:6.1f}  {exact_pct:6.1f}  {avg_err:7.2f}  {brier_str}"
+            )
+    else:
+        upsert_results(rows)
 
-        log.info("── Backtest done ───────────────────────────────────")
-        finish_pipeline_run(
-            _run_id,
-            status="success" if not dry_run else "dry_run",
-            metadata={"rows_written": len(rows), "skipped": skipped, "dry_run": dry_run},
-        )
-    except Exception as exc:
-        finish_pipeline_run(
-            _run_id,
-            status="failed",
-            metadata={
-                "error": str(exc),
-                "season": season,
-                "competition": competition,
-                "dry_run": dry_run,
-            },
-        )
-        log.error("Backtest failed: %s", exc)
-        raise
+    log.info("── Backtest done ───────────────────────────────────")
+    finish_pipeline_run(
+        _run_id,
+        status="success" if not dry_run else "dry_run",
+        metadata={"rows_written": len(rows), "skipped": skipped},
+    )
 
 
 if __name__ == "__main__":
