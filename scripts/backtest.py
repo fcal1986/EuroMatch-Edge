@@ -56,6 +56,14 @@ from urllib.parse import urlencode
 import requests
 from dotenv import load_dotenv
 
+# ── Logging ───────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("backtest")
+
 # Runtime Metadata Layer
 try:
     from utils.runtime_metadata import (
@@ -67,16 +75,6 @@ except ImportError:
     def start_pipeline_run(j, **kw): return "no-run-id"
     def finish_pipeline_run(r, **kw): pass
     def register_system_release(**kw): pass
-
-load_dotenv()
-
-# ── Logging ───────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("backtest")
 
 # Evaluation Metrics Layer
 try:
@@ -90,6 +88,8 @@ except ImportError:
     def compute_eval_metrics(*a, **kw): return {}
     def probs_from_score_grid(g): return (None, None, None)
     def probs_from_home_probability(p): return (None, None, None)
+
+load_dotenv()
 
 # ── Config from environment ───────────────────────────────────
 SUPABASE_URL      = os.environ["SUPABASE_URL"]
@@ -120,6 +120,7 @@ HEADERS_WRITE = {
 # ── football-data.org settings ────────────────────────────────
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 REQUEST_DELAY_S    = 7     # free tier: 10 req/min — 7 s gap is safe
+DEBUG_FEATURE_SAMPLE_LIMIT = int(os.environ.get("BACKTEST_DEBUG_FEATURE_SAMPLE_LIMIT", "5"))
 
 # Internal competition_code → football-data.org source_code
 # Mirrors config.py so backtest.py has no import dependency on it.
@@ -633,6 +634,58 @@ def fetch_finished_matches(
     )
 
 
+def log_match_feature_samples(matches: list[dict], limit: int = DEBUG_FEATURE_SAMPLE_LIMIT) -> None:
+    """
+    Log a small sample of model-critical input features to verify that the
+    backtest is using enriched match data rather than fallback defaults.
+    """
+    if not matches or limit <= 0:
+        return
+
+    log.info("Feature sample check (first %d matches)", min(limit, len(matches)))
+    for i, m in enumerate(matches[:limit], start=1):
+        snapshot = {
+            "idx": i,
+            "match_id": m.get("id"),
+            "home_team": m.get("home_team"),
+            "away_team": m.get("away_team"),
+            "home_strength": m.get("home_strength"),
+            "away_strength": m.get("away_strength"),
+            "form_home": m.get("form_home"),
+            "form_away": m.get("form_away"),
+            "market_home_win_odds": m.get("market_home_win_odds"),
+            "win_probability": m.get("win_probability"),
+        }
+        log.info("Feature sample %d: %s", i, json.dumps(snapshot, default=str, ensure_ascii=False))
+
+
+def log_feature_coverage(matches: list[dict]) -> None:
+    """
+    Aggregate visibility for enrichment coverage across the fetched match set.
+    This helps identify silent fallback/default behaviour in the models.
+    """
+    if not matches:
+        return
+
+    total = len(matches)
+    with_strengths = sum(
+        1 for m in matches
+        if m.get("home_strength") is not None and m.get("away_strength") is not None
+    )
+    with_form = sum(
+        1 for m in matches
+        if bool(m.get("form_home")) and bool(m.get("form_away"))
+    )
+    with_market = sum(1 for m in matches if m.get("market_home_win_odds") is not None)
+
+    log.info(
+        "Feature coverage: strengths=%d/%d (%.1f%%), form=%d/%d (%.1f%%), market_odds=%d/%d (%.1f%%)",
+        with_strengths, total, with_strengths / total * 100.0,
+        with_form, total, with_form / total * 100.0,
+        with_market, total, with_market / total * 100.0,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 # SUPABASE WRITE — model_results
 # ═══════════════════════════════════════════════════════════════
@@ -689,6 +742,8 @@ def run_backtest(
 
     matches = fetch_finished_matches(season=season, competition=competition)
     log.info("Fetched %d finished matches", len(matches))
+    log_feature_coverage(matches)
+    log_match_feature_samples(matches)
 
     if not matches:
         log.warning("No finished matches found — nothing to do.")
