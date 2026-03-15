@@ -1,42 +1,70 @@
 #!/usr/bin/env python3
 """
-EuroMatch Edge — historischer Self-Contained Backtest-Runner
-============================================================
+EuroMatch Edge — Serverseitiger Backtest-Runner
+================================================
+Läuft als GitHub Actions Step (oder lokal) nach Spieltagen.
+Berechnet Modell-Prognosen für abgeschlossene Spiele und schreibt
+Ergebnisse mit dem SERVICE_ROLE_KEY nach Supabase `model_results`.
 
-Ziel:
-- FINISHED Matches direkt von football-data.org laden
-- historische Features OHNE Current-State-Supabase-Enrichment berechnen
-- Modelle auf Basis echter VOR dem Match verfügbarer Historie ausführen
-- Ergebnisse nach Supabase `model_results` schreiben
+ARCHITEKTUR-HINWEIS — warum dieser Ansatz:
+───────────────────────────────────────────
+Die Supabase `matches`-Tabelle speichert ausschließlich bevorstehende
+Spiele (Status TIMED/SCHEDULED aus fetch_matches.py). Sie hat KEINE
+Spalten für Spielergebnisse wie actual_home_goals o.ä. — diese existieren
+im Schema schlicht nicht. Ein Filter wie
 
-Wichtig:
-- Kein Join auf Supabase `matches`
-- Keine Abhängigkeit von aktuellen Prediction-/Enrichment-Rows
-- Features werden pro Match strikt kausal aus früheren FINISHED Matches derselben Saison berechnet
+    actual_home_goals=not.is.null
+
+erzeugt deshalb HTTP 400 von PostgREST, weil die Spalte unbekannt ist.
+
+Lösung:
+  Abgeschlossene Spiele (FINISHED) werden direkt von football-data.org
+  geholt. Die Modell-Eingangsdaten (Stärke, Form, Quoten) werden aus
+  Supabase `matches` per external_id beigemischt.
+
+DATENFLUSS:
+  football-data.org (FINISHED) ──┐
+                                  ├─ merge per external_id ──► Modelle ──► model_results
+  Supabase matches (enrichment) ─┘
+
+Umgebungsvariablen (GitHub Actions Secrets):
+  SUPABASE_URL               z.B. https://xxx.supabase.co
+  SUPABASE_SERVICE_ROLE_KEY  langer JWT — NICHT der anon key
+  FOOTBALL_DATA_API_KEY      football-data.org API key (free tier reicht)
+
+Aufruf:
+  python backtest.py
+  python backtest.py --season 2024 --competition BUNDESLIGA
+  python backtest.py --dry-run
 """
 
-import argparse
+# ARCHITEKTUR-HINWEIS:
+# model_results ist die Evaluation-/Backtest-Tabelle dieses Projekts.
+# Sie speichert Predictions GEGEN tatsächliche Ergebnisse und ist damit
+# das Äquivalent zu "prediction_evaluations" aus anderen Systemen.
+# Eine separate prediction_evaluations-Tabelle existiert nicht.
+
+import os
+import sys
 import json
+import argparse
 import logging
 import math
-import os
 import time
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
-import requests
-from dotenv import load_dotenv
-
-# ── Logging ───────────────────────────────────────────────────
+# ── Logging FIRST — must be before any optional imports that may log ─
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("backtest")
+
+import requests
+from dotenv import load_dotenv
+load_dotenv()
 
 # Runtime Metadata Layer
 try:
@@ -45,10 +73,24 @@ try:
         register_system_release,
     )
 except ImportError:
+    log.warning("utils.runtime_metadata not found — versioning disabled.")
     def get_system_version(): return "dev"
     def start_pipeline_run(j, **kw): return "no-run-id"
     def finish_pipeline_run(r, **kw): pass
     def register_system_release(**kw): pass
+
+# Cross-Season Historical Feature Engine
+try:
+    from utils.historical_features import (
+        enrich_with_historical_features,
+        prev_season_year,
+    )
+    _HISTORICAL_FEATURES_AVAILABLE = True
+except ImportError:
+    log.warning("utils.historical_features not found — using Supabase enrichment only.")
+    def enrich_with_historical_features(m): return m
+    def prev_season_year(s): return None
+    _HISTORICAL_FEATURES_AVAILABLE = False
 
 # Evaluation Metrics Layer
 try:
@@ -63,55 +105,54 @@ except ImportError:
     def probs_from_score_grid(g): return (None, None, None)
     def probs_from_home_probability(p): return (None, None, None)
 
-load_dotenv()
-
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+# ── Config from environment ───────────────────────────────────
+# Use .get() with empty-string defaults so the module imports cleanly
+# even when env vars are not set (e.g. unit tests, --dry-run without Supabase).
+# Functions that actually need these values will fail at call time, not import.
+SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")
+SERVICE_ROLE_KEY  = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_API_KEY", "")
 
 TABLE = "model_results"
-MODEL_VERSION = os.environ.get("MODEL_VERSION", "1.0")
+
+# ── Modell-Versionen ─────────────────────────────────────────
+# Bump these when the corresponding logic changes.
+# Must match what compute_predictions.py uses when possible.
+# Can be overridden via ENV for controlled rollouts.
+MODEL_VERSION       = os.environ.get("MODEL_VERSION",       "1.0")
 CALIBRATION_VERSION = os.environ.get("CALIBRATION_VERSION", "1.0")
-WEIGHTS_VERSION = os.environ.get("WEIGHTS_VERSION", "1.0")
+WEIGHTS_VERSION     = os.environ.get("WEIGHTS_VERSION",     "1.0")
 
 HEADERS_READ = {
-    "apikey": SERVICE_ROLE_KEY,
+    "apikey":        SERVICE_ROLE_KEY,
     "Authorization": f"Bearer {SERVICE_ROLE_KEY}",
-    "Accept": "application/json",
+    "Accept":        "application/json",
 }
 HEADERS_WRITE = {
     **HEADERS_READ,
     "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates",
+    "Prefer":       "resolution=merge-duplicates",
 }
 
+# ── football-data.org settings ────────────────────────────────
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
-REQUEST_DELAY_S = 7
-DEBUG_FEATURE_SAMPLE_LIMIT = int(os.environ.get("BACKTEST_DEBUG_FEATURE_SAMPLE_LIMIT", "5"))
-MIN_HISTORY_MATCHES_FOR_STRENGTH = int(os.environ.get("BACKTEST_MIN_HISTORY_MATCHES_FOR_STRENGTH", "3"))
-FORM_WINDOW = int(os.environ.get("BACKTEST_FORM_WINDOW", "5"))
+REQUEST_DELAY_S    = 7     # free tier: 10 req/min — 7 s gap is safe
 
+# Internal competition_code → football-data.org source_code
+# Mirrors config.py so backtest.py has no import dependency on it.
 COMP_CODE_TO_SOURCE = {
-    "PREMIER_LEAGUE": "PL",
-    "BUNDESLIGA": "BL1",
-    "LA_LIGA": "PD",
-    "SERIE_A": "SA",
-    "LIGUE_1": "FL1",
-    "EREDIVISIE": "DED",
-    "PRIMEIRA_LIGA": "PPL",
-    "CHAMPIONSHIP": "ELC",
-    "CHAMPIONS_LEAGUE": "CL",
+    "PREMIER_LEAGUE":  "PL",
+    "BUNDESLIGA":      "BL1",
+    "LA_LIGA":         "PD",
+    "SERIE_A":         "SA",
+    "LIGUE_1":         "FL1",
+    "EREDIVISIE":      "DED",
+    "PRIMEIRA_LIGA":   "PPL",
+    "CHAMPIONSHIP":    "ELC",
+    "CHAMPIONS_LEAGUE":"CL",
+    # SUPER_LIG (TSL) and EUROPA_LEAGUE (EL) are inactive on the free tier.
+    # Add them here when re-enabled in config.py.
 }
-
-
-def parse_iso_dt(value: Optional[str]) -> datetime:
-    if not value:
-        return datetime.min
-    s = value.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(s)
-    except ValueError:
-        return datetime.min
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -119,6 +160,7 @@ def parse_iso_dt(value: Optional[str]) -> datetime:
 # ═══════════════════════════════════════════════════════════════
 
 def calc_points(pred: str, actual_home: int, actual_away: int) -> int:
+    """4 = exakter Score, 2 = richtige Tendenz (H/D/A), 0 = falsch."""
     if not pred:
         return 0
     parts = pred.split(":")
@@ -131,11 +173,23 @@ def calc_points(pred: str, actual_home: int, actual_away: int) -> int:
     if ph == actual_home and pa == actual_away:
         return 4
     pred_t = "H" if ph > pa else ("A" if ph < pa else "D")
-    act_t = "H" if actual_home > actual_away else ("A" if actual_home < actual_away else "D")
+    act_t  = "H" if actual_home > actual_away else ("A" if actual_home < actual_away else "D")
     return 2 if pred_t == act_t else 0
 
 
 def calc_outcome_label(pred: str, actual_home: int, actual_away: int) -> str:
+    """
+    4-stufige Bewertungskategorie für die Historien-Seite.
+
+    exact     — Exakter Score getroffen (z.B. 2:1 getippt, 2:1 gespielt)
+    goal_diff — Richtige Tordifferenz, aber falscher Score (z.B. 2:1 → 3:2)
+    tendency  — Richtige Tendenz (Heimsieg/Remis/Auswärtssieg), falsche Tordiff
+    wrong     — Komplett falsch
+
+    Punkte:  exact=4, goal_diff=2, tendency=2, wrong=0
+    (goal_diff und tendency ergeben beide 2 Kicktipp-Punkte, aber sind
+    unterschiedliche Qualitäten — goal_diff ist präziser)
+    """
     if not pred:
         return "wrong"
     parts = pred.split(":")
@@ -146,26 +200,33 @@ def calc_outcome_label(pred: str, actual_home: int, actual_away: int) -> str:
     except ValueError:
         return "wrong"
 
+    # Exakter Score
     if ph == actual_home and pa == actual_away:
         return "exact"
 
     pred_diff = ph - pa
-    act_diff = actual_home - actual_away
-    pred_t = "H" if ph > pa else ("A" if ph < pa else "D")
-    act_t = "H" if actual_home > actual_away else ("A" if actual_home < actual_away else "D")
+    act_diff  = actual_home - actual_away
 
+    pred_t = "H" if ph > pa else ("A" if ph < pa else "D")
+    act_t  = "H" if actual_home > actual_away else ("A" if actual_home < actual_away else "D")
+
+    # Richtige Tordifferenz (aber anderer Score, z.B. 2:1 vs 3:2)
     if pred_diff == act_diff and pred_t == act_t:
         return "goal_diff"
+
+    # Richtige Tendenz (Heimsieg/Remis/Auswärtssieg)
     if pred_t == act_t:
         return "tendency"
+
     return "wrong"
 
 
 # ═══════════════════════════════════════════════════════════════
-# MATH HELPERS
+# PURE MATH HELPERS (mirror of js/models/shared.js)
 # ═══════════════════════════════════════════════════════════════
 
 def form_score(form: list) -> float:
+    """W=3, D=1, L=0 → normalised 0–1."""
     if not form:
         return 0.5
     pts = sum(3 if r == "W" else 1 if r == "D" else 0 for r in form)
@@ -173,6 +234,7 @@ def form_score(form: list) -> float:
 
 
 def strength_diff(m: dict) -> float:
+    """(homeStrength - awayStrength) / 100.  Range: −1…+1."""
     h = m.get("home_strength")
     a = m.get("away_strength")
     if h is None or a is None:
@@ -181,10 +243,12 @@ def strength_diff(m: dict) -> float:
 
 
 def pois(k: int, lam: float) -> float:
+    """P(X = k) for Poisson(λ=lam)."""
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
 def score_grid(lambda_h: float, lambda_a: float, max_g: int = 6) -> dict:
+    """Full (max_g+1)² score probability grid."""
     return {
         f"{h}:{a}": pois(h, lambda_h) * pois(a, lambda_a)
         for h in range(max_g + 1)
@@ -193,15 +257,12 @@ def score_grid(lambda_h: float, lambda_a: float, max_g: int = 6) -> dict:
 
 
 def apply_dixon_coles(grid: dict, lh: float, la: float, rho: float = 0.13) -> dict:
+    """Dixon–Coles low-score correction on an existing score grid."""
     def tau(h: int, a: int) -> float:
-        if h == 0 and a == 0:
-            return 1 - lh * la * rho
-        if h == 1 and a == 0:
-            return 1 + la * rho
-        if h == 0 and a == 1:
-            return 1 + lh * rho
-        if h == 1 and a == 1:
-            return 1 - rho
+        if h == 0 and a == 0: return 1 - lh * la * rho
+        if h == 1 and a == 0: return 1 + la * rho
+        if h == 0 and a == 1: return 1 + lh * rho
+        if h == 1 and a == 1: return 1 - rho
         return 1.0
 
     corrected = dict(grid)
@@ -223,25 +284,19 @@ def winner_from_grid(grid: dict) -> str:
     p_home = p_away = p_draw = 0.0
     for score, prob in grid.items():
         h, a = map(int, score.split(":"))
-        if h > a:
-            p_home += prob
-        elif a > h:
-            p_away += prob
-        else:
-            p_draw += prob
-    if p_home >= p_away and p_home >= p_draw:
-        return "home"
-    if p_away >= p_home and p_away >= p_draw:
-        return "away"
+        if h > a:   p_home += prob
+        elif a > h: p_away += prob
+        else:       p_draw += prob
+    if p_home >= p_away and p_home >= p_draw: return "home"
+    if p_away >= p_home and p_away >= p_draw: return "away"
     return "draw"
 
 
 # ═══════════════════════════════════════════════════════════════
-# MODEL IMPLEMENTATIONS
+# MODEL IMPLEMENTATIONS (mirror of js/models/*.js)
 # ═══════════════════════════════════════════════════════════════
 
-MODELS: Dict[str, Any] = {}
-
+MODELS: dict = {}
 
 def register_model(fn):
     MODELS[fn.__name__] = fn
@@ -250,161 +305,247 @@ def register_model(fn):
 
 @register_model
 def ensemble(m: dict) -> dict:
-    diff = strength_diff(m)
-    form_h = form_score(m.get("form_home") or [])
-    form_a = form_score(m.get("form_away") or [])
+    diff     = strength_diff(m)
+    form_h   = form_score(m.get("form_home") or [])
+    form_a   = form_score(m.get("form_away") or [])
     form_adv = form_h - form_a
-    raw = (m.get("win_probability", 50) / 100) * 0.6 + (0.5 + diff * 0.25 + form_adv * 0.15)
-    home_p = min(0.95, max(0.05, raw / 1.6))
-    winner = "home" if home_p > 0.55 else ("away" if home_p < 0.40 else "draw")
-    conf = int(50 + abs(home_p - 0.5) * 80)
-    hg = 1.2 + diff * 1.5 + form_adv * 0.5
-    ag = 0.7 - diff * 0.8 + (1 - form_adv) * 0.3
+    raw      = (m.get("win_probability", 50) / 100) * 0.6 + (0.5 + diff * 0.25 + form_adv * 0.15)
+    home_p   = min(0.95, max(0.05, raw / 1.6))
+    winner   = "home" if home_p > 0.55 else ("away" if home_p < 0.40 else "draw")
+    conf     = int(50 + abs(home_p - 0.5) * 80)
+    hg       = 1.2 + diff * 1.5 + form_adv * 0.5
+    ag       = 0.7 - diff * 0.8 + (1 - form_adv) * 0.3
     main_tip = f"{max(0, round(hg))}:{max(0, round(ag))}"
     _ph, _pd, _pa = probs_from_home_probability(home_p)
-    return {
-        "predicted_winner": winner,
-        "predicted_score": main_tip,
-        "confidence_score": min(99, conf),
-        "prob_home": _ph,
-        "prob_draw": _pd,
-        "prob_away": _pa,
-    }
+    return {"predicted_winner": winner, "predicted_score": main_tip,
+            "confidence_score": min(99, conf),
+            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
 @register_model
 def poisson(m: dict) -> dict:
-    diff = strength_diff(m)
+    diff   = strength_diff(m)
     form_h = form_score(m.get("form_home") or [])
     form_a = form_score(m.get("form_away") or [])
-    lh = max(0.3, 1.4 + diff * 1.2 + (form_h - 0.5) * 0.6)
-    la = max(0.3, 1.1 - diff * 0.8 + (form_a - 0.5) * 0.4)
-    grid = score_grid(lh, la)
+    lh     = max(0.3, 1.4 + diff * 1.2 + (form_h - 0.5) * 0.6)
+    la     = max(0.3, 1.1 - diff * 0.8 + (form_a - 0.5) * 0.4)
+    grid   = score_grid(lh, la)
     winner = winner_from_grid(grid)
-    top = top_scores(grid, 1)
+    top    = top_scores(grid, 1)
     main_tip = top[0][0] if top else f"{round(lh)}:{round(la)}"
-    conf = int(min(85, top[0][1] * 100 * 2.5)) if top else 50
+    conf   = int(min(85, top[0][1] * 100 * 2.5)) if top else 50
     _ph, _pd, _pa = probs_from_score_grid(grid)
-    return {
-        "predicted_winner": winner,
-        "predicted_score": main_tip,
-        "confidence_score": conf,
-        "prob_home": _ph,
-        "prob_draw": _pd,
-        "prob_away": _pa,
-    }
+    return {"predicted_winner": winner, "predicted_score": main_tip,
+            "confidence_score": conf,
+            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
 @register_model
 def dc(m: dict) -> dict:
-    diff = strength_diff(m)
+    diff   = strength_diff(m)
     form_h = form_score(m.get("form_home") or [])
     form_a = form_score(m.get("form_away") or [])
-    lh = max(0.3, 1.3 + diff * 1.0 + (form_h - 0.5) * 0.5)
-    la = max(0.3, 1.0 - diff * 0.7 + (form_a - 0.5) * 0.4)
-    raw = score_grid(lh, la)
-    grid = apply_dixon_coles(raw, lh, la)
+    lh     = max(0.3, 1.3 + diff * 1.0 + (form_h - 0.5) * 0.5)
+    la     = max(0.3, 1.0 - diff * 0.7 + (form_a - 0.5) * 0.4)
+    raw    = score_grid(lh, la)
+    grid   = apply_dixon_coles(raw, lh, la)
     winner = winner_from_grid(grid)
-    top = top_scores(grid, 1)
+    top    = top_scores(grid, 1)
     main_tip = top[0][0] if top else f"{round(lh)}:{round(la)}"
-    conf = int(min(85, top[0][1] * 100 * 2.5)) if top else 50
+    conf   = int(min(85, top[0][1] * 100 * 2.5)) if top else 50
     _ph, _pd, _pa = probs_from_score_grid(grid)
-    return {
-        "predicted_winner": winner,
-        "predicted_score": main_tip,
-        "confidence_score": conf,
-        "prob_home": _ph,
-        "prob_draw": _pd,
-        "prob_away": _pa,
-    }
+    return {"predicted_winner": winner, "predicted_score": main_tip,
+            "confidence_score": conf,
+            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
 @register_model
 def elo(m: dict) -> dict:
-    diff = strength_diff(m)
+    diff   = strength_diff(m)
     home_p = 1 / (1 + 10 ** (-(diff * 4 + 0.1)))
     winner = "home" if home_p > 0.58 else ("away" if home_p < 0.38 else "draw")
-    conf = int(45 + abs(home_p - 0.5) * 90)
-    hg = 1.0 + diff * 1.8
-    ag = 0.9 - diff * 0.9
+    conf   = int(45 + abs(home_p - 0.5) * 90)
+    hg     = 1.0 + diff * 1.8
+    ag     = 0.9 - diff * 0.9
     main_tip = f"{max(0, round(hg))}:{max(0, round(ag))}"
     _ph, _pd, _pa = probs_from_home_probability(home_p)
-    return {
-        "predicted_winner": winner,
-        "predicted_score": main_tip,
-        "confidence_score": min(99, conf),
-        "prob_home": _ph,
-        "prob_draw": _pd,
-        "prob_away": _pa,
-    }
+    return {"predicted_winner": winner, "predicted_score": main_tip,
+            "confidence_score": min(99, conf),
+            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
 @register_model
 def market(m: dict) -> dict:
-    quote = m.get("market_home_win_odds") or m.get("market_signal_home") or 2.0
+    # Column in Supabase is market_home_win_odds (set by fetch_matches.py)
+    quote  = m.get("market_home_win_odds") or m.get("market_signal_home") or 2.0
     implied = min(0.92, max(0.08, (1 / quote) * 0.9))
-    winner = "home" if implied > 0.55 else ("away" if implied < 0.40 else "draw")
-    conf = int(40 + implied * 45)
-    diff = strength_diff(m)
-    hg = 0.9 + diff * 1.2
-    ag = 0.8 - diff * 0.6
+    winner  = "home" if implied > 0.55 else ("away" if implied < 0.40 else "draw")
+    conf    = int(40 + implied * 45)
+    diff    = strength_diff(m)
+    hg      = 0.9 + diff * 1.2
+    ag      = 0.8 - diff * 0.6
     main_tip = f"{max(0, round(hg))}:{max(0, round(ag))}"
     _ph, _pd, _pa = probs_from_home_probability(implied)
-    return {
-        "predicted_winner": winner,
-        "predicted_score": main_tip,
-        "confidence_score": min(90, conf),
-        "prob_home": _ph,
-        "prob_draw": _pd,
-        "prob_away": _pa,
-    }
+    return {"predicted_winner": winner, "predicted_score": main_tip,
+            "confidence_score": min(90, conf),
+            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
 # ═══════════════════════════════════════════════════════════════
-# FOOTBALL-DATA.ORG HELPERS
+# SUPABASE HELPERS — reads only, full error context on failure
 # ═══════════════════════════════════════════════════════════════
 
-def _fd_get(path: str, params: dict) -> requests.Response:
+def _supabase_get(table: str, params: list) -> list:
+    """
+    GET from Supabase PostgREST.
+    On any non-2xx response raises RuntimeError with URL + status + body.
+    Never swallows errors silently.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{urlencode(params)}"
+    try:
+        r = requests.get(url, headers=HEADERS_READ, timeout=15)
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Supabase GET network error: {exc}") from exc
+
+    if not r.ok:
+        raise RuntimeError(
+            f"Supabase GET failed\n"
+            f"  Table  : {table}\n"
+            f"  URL    : {r.url}\n"
+            f"  Status : {r.status_code}\n"
+            f"  Body   : {r.text[:600]}\n"
+            f"\nHint: HTTP 400 usually means a column in the filter does not "
+            f"exist in the table or view. Check the column names carefully."
+        )
+
+    data = r.json()
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"Supabase GET returned unexpected type {type(data).__name__}. "
+            f"Expected list. URL: {r.url}  Body: {r.text[:300]}"
+        )
+    return data
+
+
+def fetch_supabase_enrichment(competition_code: str | None = None) -> dict:
+    """
+    Load DISPLAY metadata from Supabase `matches` (home_team, away_team,
+    league_abbr, flag, market_home_win_odds).
+
+    Architectural note:
+      - Feature computation (strength, form, win_probability) is handled
+        by historical_features.py from football-data.org data only.
+      - This function provides ONLY display/context enrichment.
+      - If Supabase is unavailable, returns an empty dict and logs a warning.
+        The backtest will proceed with team names from football-data.org.
+
+    Returns dict: external_id → row  (e.g. "football_data_12345" → {...})
+    """
+    if not SUPABASE_URL or not SERVICE_ROLE_KEY:
+        log.warning(
+            "Supabase config missing (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY) — "
+            "display enrichment disabled; team names from football-data.org only."
+        )
+        return {}
+
+    params = [
+        # Display + market columns only.
+        # Strength/form are computed by historical_features.py, not from Supabase.
+        ("select", "external_id,competition_code,league_abbr,flag,"
+                   "home_team,away_team,"
+                   "market_home_win_odds"),
+        ("limit",  "5000"),
+    ]
+    if competition_code:
+        params.append(("competition_code", f"eq.{competition_code}"))
+
+    try:
+        rows = _supabase_get("matches", params)
+    except RuntimeError as exc:
+        log.warning("Supabase enrichment failed — proceeding without display data.\n  %s", exc)
+        return {}
+
+    log.info("Supabase display enrichment: %d rows loaded", len(rows))
+    return {row["external_id"]: row for row in rows if row.get("external_id")}
+
+
+# ═══════════════════════════════════════════════════════════════
+# FOOTBALL-DATA.ORG — fetch FINISHED matches with actual results
+# ═══════════════════════════════════════════════════════════════
+
+def _fd_get(path: str, params: dict) -> dict:
+    """
+    GET from football-data.org v4 API with full error context.
+    Returns parsed JSON dict. Raises RuntimeError on failure.
+    """
     if not FOOTBALL_DATA_KEY:
         raise RuntimeError(
-            "FOOTBALL_DATA_API_KEY is not set. Add it to GitHub Secrets and expose it in the workflow."
+            "FOOTBALL_DATA_API_KEY is not set.\n"
+            "This variable is required to fetch finished match results.\n"
+            "Add it to GitHub Secrets and expose it in backtest-pipeline.yml:\n"
+            "  env:\n"
+            "    FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}"
         )
 
     url = f"{FOOTBALL_DATA_BASE}/{path.lstrip('/')}"
     try:
-        return requests.get(
+        r = requests.get(
             url,
             headers={"X-Auth-Token": FOOTBALL_DATA_KEY},
             params=params,
-            timeout=20,
+            timeout=15,
         )
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(f"football-data.org network error: {exc}") from exc
 
-
-def parse_season_year(season: Optional[str]) -> Optional[str]:
-    if not season:
-        return None
-    year_part = season.split("/")[0].strip()
-    if len(year_part) == 2:
-        year_part = f"20{year_part}"
-    return year_part if year_part.isdigit() else None
+    return r   # caller inspects status
 
 
-def fetch_finished_matches(season: Optional[str] = None, competition: Optional[str] = None) -> List[Dict[str, Any]]:
-    season_year = parse_season_year(season)
+def fetch_finished_from_api(
+    competition_code: str | None = None,
+    season: str | None = None,
+    enrichment: dict | None = None,
+) -> list:
+    """
+    Fetch FINISHED matches from football-data.org and merge enrichment data.
 
-    if competition:
-        if competition not in COMP_CODE_TO_SOURCE:
-            raise RuntimeError(f"Unknown competition_code '{competition}'. Known: {sorted(COMP_CODE_TO_SOURCE)}")
-        comps = {competition: COMP_CODE_TO_SOURCE[competition]}
+    Returns list of normalised match dicts, one per finished game, each
+    containing actual_home_goals, actual_away_goals, and model inputs.
+
+    Args:
+        competition_code: Internal code, e.g. 'BUNDESLIGA'. None = all active.
+        season: Year string, e.g. '2024' or '2024/25' (only year part is used).
+        enrichment: Pre-fetched Supabase enrichment dict. Fetched if None.
+    """
+    if enrichment is None:
+        enrichment = fetch_supabase_enrichment(competition_code)
+
+    # Determine which competitions to request
+    if competition_code:
+        if competition_code not in COMP_CODE_TO_SOURCE:
+            raise RuntimeError(
+                f"Unknown competition_code '{competition_code}'.\n"
+                f"Known codes: {sorted(COMP_CODE_TO_SOURCE)}"
+            )
+        comps = {competition_code: COMP_CODE_TO_SOURCE[competition_code]}
     else:
         comps = dict(COMP_CODE_TO_SOURCE)
 
-    all_matches: List[Dict[str, Any]] = []
+    # Extract 4-digit season year if provided
+    season_year: str | None = None
+    if season:
+        # Accept "2024/25" or "2024" or "24/25"
+        year_part = season.split("/")[0].strip()
+        if len(year_part) == 2:
+            year_part = f"20{year_part}"
+        season_year = year_part if year_part.isdigit() else None
+        if not season_year:
+            log.warning("Could not parse season year from '%s' — ignoring", season)
+
+    all_matches: list[dict] = []
 
     for comp_code, fd_source in comps.items():
-        params: Dict[str, Any] = {"status": "FINISHED", "limit": 500}
+        params: dict = {"status": "FINISHED", "limit": 100}
         if season_year:
             params["season"] = season_year
 
@@ -415,275 +556,222 @@ def fetch_finished_matches(season: Optional[str] = None, competition: Optional[s
             time.sleep(REQUEST_DELAY_S)
             continue
         if r.status_code == 403:
-            log.warning("%s (%s): 403 Forbidden — not available on current API tier", comp_code, fd_source)
+            log.warning(
+                "%s (%s): 403 Forbidden — competition not available on current API tier",
+                comp_code, fd_source,
+            )
             time.sleep(REQUEST_DELAY_S)
             continue
         if r.status_code == 429:
             log.warning("%s: rate-limited (429) — sleeping 60 s", comp_code)
             time.sleep(60)
             r = _fd_get(f"competitions/{fd_source}/matches", params)
+            if not r.ok:
+                log.error("%s: still failing after rate-limit retry — skipping", comp_code)
+                continue
 
         if not r.ok:
-            log.error("%s: HTTP %d — %s — skipping", comp_code, r.status_code, r.text[:200])
+            log.error(
+                "%s: HTTP %d — %s — skipping",
+                comp_code, r.status_code, r.text[:200],
+            )
             time.sleep(REQUEST_DELAY_S)
             continue
 
-        payload = r.json()
-        raw_matches = payload.get("matches", [])
-        season_info = payload.get("filters", {}).get("season") or season_year or ""
+        raw_matches = r.json().get("matches", [])
         log.info("%s: %d FINISHED matches from football-data", comp_code, len(raw_matches))
 
         for raw in raw_matches:
-            ft = raw.get("score", {}).get("fullTime", {})
+            # Parse actual goals from the football-data score object
+            ft         = raw.get("score", {}).get("fullTime", {})
             home_goals = ft.get("home")
             away_goals = ft.get("away")
+
             if home_goals is None or away_goals is None:
+                log.debug("Skipping match %s — fullTime score missing", raw.get("id"))
                 continue
 
-            home_team = raw.get("homeTeam", {})
-            away_team = raw.get("awayTeam", {})
-            match_id = f"football_data_{raw.get('id')}"
+            fd_match_id = raw.get("id")
+            external_id = f"football_data_{fd_match_id}"
+            enrich      = enrichment.get(external_id, {})
+
+            if not enrich:
+                log.debug(
+                    "No Supabase enrichment for %s — model inputs will use defaults",
+                    external_id,
+                )
+
+            # Extract team names from football-data.org (fallback when Supabase enrichment missing)
+            raw_home = raw.get("homeTeam", {})
+            raw_away = raw.get("awayTeam", {})
+            home_name = enrich.get("home_team") or raw_home.get("name") or raw_home.get("shortName") or "?"
+            away_name = enrich.get("away_team") or raw_away.get("name") or raw_away.get("shortName") or "?"
+
+            # Parse team IDs and kickoff for historical feature engine
+            _home_id = raw_home.get("id")
+            _away_id = raw_away.get("id")
+            _kickoff_dt: datetime | None = None
+            _utc_date = raw.get("utcDate")
+            if _utc_date:
+                try:
+                    _kickoff_dt = datetime.fromisoformat(
+                        _utc_date.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    _kickoff_dt = None
 
             all_matches.append({
-                "id": match_id,
-                "external_id": match_id,
-                "competition_code": comp_code,
-                "league_abbr": comp_code,
-                "flag": "",
-                "season": str(season_info or ""),
-                "kickoff_at": raw.get("utcDate"),
-                "home_team": home_team.get("name") or home_team.get("shortName") or "?",
-                "away_team": away_team.get("name") or away_team.get("shortName") or "?",
-                "home_team_id": home_team.get("id"),
-                "away_team_id": away_team.get("id"),
+                # ── Identity ──────────────────────────────────────
+                # Use external_id as match_id so it matches the
+                # external_id stored in the Supabase matches table.
+                "id":                external_id,
+                "external_id":       external_id,
+
+                # ── Internal keys for historical feature engine ───
+                # Prefixed with _ so they are never written to Supabase.
+                "_home_team_id":     _home_id,
+                "_away_team_id":     _away_id,
+                "_kickoff_dt":       _kickoff_dt,
+
+                # ── Actual result (from football-data.org) ────────
                 "actual_home_goals": int(home_goals),
                 "actual_away_goals": int(away_goals),
+
+                # ── Display metadata (from Supabase, falls back to API) ─
+                "home_team":         home_name,
+                "away_team":         away_name,
+                "flag":              enrich.get("flag", ""),
+                "league_abbr":       enrich.get("league_abbr", comp_code),
+
+                # ── Model inputs ─────────────────────────────────────
+                # strength/form/win_probability are computed by
+                # enrich_with_historical_features() from football-data history.
+                # Initialised to None/[] here as placeholders.
+                "home_strength":        None,
+                "away_strength":        None,
+                "form_home":            [],
+                "form_away":            [],
+                "market_home_win_odds": enrich.get("market_home_win_odds"),
+                "win_probability":      50,
+                "feature_src":          "pending",
+
+                # ── Context ───────────────────────────────────────
+                "competition_code":  enrich.get("competition_code", comp_code),
+                "season":            season_year or "",
+                "kickoff_at":        _utc_date,
             })
 
         time.sleep(REQUEST_DELAY_S)
 
-    all_matches.sort(key=lambda m: (m.get("competition_code", ""), m.get("season", ""), parse_iso_dt(m.get("kickoff_at")), m.get("id", "")))
     return all_matches
 
 
-# ═══════════════════════════════════════════════════════════════
-# SELF-CONTAINED HISTORICAL FEATURE ENGINE
-# ═══════════════════════════════════════════════════════════════
+def fetch_finished_matches(
+    season: str | None = None,
+    competition: str | None = None,
+) -> list:
+    """
+    Public entry point: load finished matches with actual results.
 
-@dataclass
-class TeamHistory:
-    played: int = 0
-    wins: int = 0
-    draws: int = 0
-    losses: int = 0
-    goals_for: int = 0
-    goals_against: int = 0
-    results: deque = field(default_factory=lambda: deque(maxlen=FORM_WINDOW))
+    Cross-Season Strategy (historical_self_contained_v2):
+      1. Fetches current season (season) from football-data.org
+      2. Fetches previous season (season-1) for historical context
+      3. Merges both into one list sorted by kickoff_at
+      4. Calls enrich_with_historical_features() to compute
+         strength/form/win_probability using strict temporal ordering
+         (no data leakage: only matches BEFORE each match are used)
+      5. Returns only current-season matches (for evaluation)
+         but uses both seasons as feature history
+    """
+    enrichment   = fetch_supabase_enrichment(competition)
 
+    # Parse season year for prev-season lookup
+    season_year: str | None = None
+    if season:
+        year_part = season.split("/")[0].strip()
+        if len(year_part) == 2:
+            year_part = f"20{year_part}"
+        season_year = year_part if year_part.isdigit() else None
 
-def result_code(goals_for: int, goals_against: int) -> str:
-    if goals_for > goals_against:
-        return "W"
-    if goals_for == goals_against:
-        return "D"
-    return "L"
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def normalize_to_100(value: float, low: float, high: float) -> float:
-    if high <= low:
-        return 50.0
-    x = (value - low) / (high - low)
-    return clamp(x, 0.0, 1.0) * 100.0
-
-
-def derive_team_strength(hist: TeamHistory) -> Optional[float]:
-    if hist.played < MIN_HISTORY_MATCHES_FOR_STRENGTH:
-        return None
-
-    ppg = (hist.wins * 3 + hist.draws) / hist.played
-    gd_pg = (hist.goals_for - hist.goals_against) / hist.played
-    win_rate = hist.wins / hist.played
-    recent = form_score(list(hist.results))
-
-    ppg_score = normalize_to_100(ppg, 0.0, 3.0)
-    gd_score = normalize_to_100(gd_pg, -2.0, 2.0)
-    win_score = normalize_to_100(win_rate, 0.0, 1.0)
-    recent_score = normalize_to_100(recent, 0.0, 1.0)
-
-    strength = (
-        ppg_score * 0.45 +
-        gd_score * 0.20 +
-        win_score * 0.15 +
-        recent_score * 0.20
+    # Fetch current season first (needed to infer year when --season not passed)
+    current_matches = fetch_finished_from_api(
+        competition_code=competition,
+        season=season,
+        enrichment=enrichment,
     )
-    return round(clamp(strength, 0.0, 100.0), 2)
+    log.info("Current season matches: %d", len(current_matches))
 
+    # If season_year was not explicitly given, infer it from the actual match dates.
+    # football-data.org returns the current season when no ?season= param is given.
+    if season_year is None and current_matches:
+        inferred_dates = [
+            m.get("_kickoff_dt") for m in current_matches
+            if m.get("_kickoff_dt") is not None
+        ]
+        if inferred_dates:
+            # Most matches are mid-season — take the most common year
+            years = [d.year for d in inferred_dates]
+            season_year = str(max(set(years), key=years.count))
+            log.info("Season year inferred from match dates: %s", season_year)
 
-def derive_win_probability(home_strength: Optional[float], away_strength: Optional[float]) -> int:
-    if home_strength is None or away_strength is None:
-        return 50
-    diff = (home_strength - away_strength) / 12.0
-    home_p = 1.0 / (1.0 + math.exp(-diff))
-    return int(round(clamp(home_p, 0.05, 0.95) * 100))
+    prev_year = prev_season_year(season_year)
 
+    # Fetch previous season for cross-season history
+    prev_matches: list[dict] = []
+    if prev_year and _HISTORICAL_FEATURES_AVAILABLE:
+        log.info("Fetching previous season %s for cross-season history...", prev_year)
+        try:
+            prev_matches = fetch_finished_from_api(
+                competition_code=competition,
+                season=prev_year,
+                enrichment=enrichment,
+            )
+            log.info("Previous season matches: %d", len(prev_matches))
+        except Exception as exc:
+            log.warning("Could not fetch previous season %s: %s — proceeding without", prev_year, exc)
+            prev_matches = []
+    else:
+        if not _HISTORICAL_FEATURES_AVAILABLE:
+            log.info("historical_features not available — skipping cross-season fetch")
+        elif not prev_year:
+            log.info("No season specified — skipping cross-season fetch")
 
-def annotate_historical_features(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    histories: Dict[tuple, Dict[Any, TeamHistory]] = defaultdict(dict)
-    enriched_matches: List[Dict[str, Any]] = []
+    if not _HISTORICAL_FEATURES_AVAILABLE:
+        return current_matches
 
-    for m in matches:
-        scope = (m.get("competition_code", ""), m.get("season", ""))
-        team_hist = histories[scope]
-
-        home_id = m.get("home_team_id") or f"team:{m.get('home_team')}"
-        away_id = m.get("away_team_id") or f"team:{m.get('away_team')}"
-
-        if home_id not in team_hist:
-            team_hist[home_id] = TeamHistory()
-        if away_id not in team_hist:
-            team_hist[away_id] = TeamHistory()
-
-        home_hist = team_hist[home_id]
-        away_hist = team_hist[away_id]
-
-        form_home = list(home_hist.results)
-        form_away = list(away_hist.results)
-        home_strength = derive_team_strength(home_hist)
-        away_strength = derive_team_strength(away_hist)
-        win_probability = derive_win_probability(home_strength, away_strength)
-
-        enriched = dict(m)
-        enriched.update({
-            "home_strength": home_strength,
-            "away_strength": away_strength,
-            "form_home": form_home,
-            "form_away": form_away,
-            "market_home_win_odds": None,
-            "market_signal_home": None,
-            "win_probability": win_probability,
-            "history_home_matches": home_hist.played,
-            "history_away_matches": away_hist.played,
-            "feature_source": "historical_self_contained",
-        })
-        enriched_matches.append(enriched)
-
-        actual_h = int(m["actual_home_goals"])
-        actual_a = int(m["actual_away_goals"])
-
-        home_hist.played += 1
-        away_hist.played += 1
-        home_hist.goals_for += actual_h
-        home_hist.goals_against += actual_a
-        away_hist.goals_for += actual_a
-        away_hist.goals_against += actual_h
-
-        home_result = result_code(actual_h, actual_a)
-        away_result = result_code(actual_a, actual_h)
-
-        if home_result == "W":
-            home_hist.wins += 1
-            away_hist.losses += 1
-        elif home_result == "D":
-            home_hist.draws += 1
-            away_hist.draws += 1
-        else:
-            home_hist.losses += 1
-            away_hist.wins += 1
-
-        home_hist.results.append(home_result)
-        away_hist.results.append(away_result)
-
-    return enriched_matches
-
-
-# ═══════════════════════════════════════════════════════════════
-# FEATURE LOGGING
-# ═══════════════════════════════════════════════════════════════
-
-def compute_feature_coverage(matches: List[Dict[str, Any]]) -> Dict[str, float]:
-    total = len(matches)
-    if total == 0:
-        return {
-            "total": 0,
-            "strengths": 0,
-            "form": 0,
-            "market_odds": 0,
-            "strength_cov": 0.0,
-            "form_cov": 0.0,
-            "market_cov": 0.0,
-        }
-
-    strengths = sum(1 for m in matches if m.get("home_strength") is not None and m.get("away_strength") is not None)
-    form = sum(1 for m in matches if bool(m.get("form_home")) and bool(m.get("form_away")))
-    market = sum(1 for m in matches if m.get("market_home_win_odds") is not None)
-    return {
-        "total": total,
-        "strengths": strengths,
-        "form": form,
-        "market_odds": market,
-        "strength_cov": strengths / total,
-        "form_cov": form / total,
-        "market_cov": market / total,
-    }
-
-
-def log_feature_coverage(matches: List[Dict[str, Any]]) -> None:
-    c = compute_feature_coverage(matches)
-    if c["total"] == 0:
-        return
-    log.info(
-        "Historical feature coverage: strengths=%d/%d (%.1f%%), form=%d/%d (%.1f%%), market_odds=%d/%d (%.1f%%)",
-        c["strengths"], c["total"], c["strength_cov"] * 100.0,
-        c["form"], c["total"], c["form_cov"] * 100.0,
-        c["market_odds"], c["total"], c["market_cov"] * 100.0,
+    # Merge and sort all matches by kickoff_at for history index
+    all_for_history = current_matches + prev_matches
+    all_for_history.sort(
+        key=lambda m: m.get("_kickoff_dt") or datetime.min.replace(tzinfo=timezone.utc)
     )
 
+    # Enrich with cross-season historical features
+    # This mutates each match dict in-place
+    enrich_with_historical_features(all_for_history)
 
-def log_match_feature_samples(matches: List[Dict[str, Any]], limit: int = DEBUG_FEATURE_SAMPLE_LIMIT) -> None:
-    if not matches or limit <= 0:
-        return
-    log.info("Historical feature samples (first %d matches)", min(limit, len(matches)))
-    for i, m in enumerate(matches[:limit], start=1):
-        snapshot = {
-            "idx": i,
-            "match_id": m.get("id"),
-            "kickoff_at": m.get("kickoff_at"),
-            "home_team": m.get("home_team"),
-            "away_team": m.get("away_team"),
-            "history_home_matches": m.get("history_home_matches"),
-            "history_away_matches": m.get("history_away_matches"),
-            "home_strength": m.get("home_strength"),
-            "away_strength": m.get("away_strength"),
-            "form_home": m.get("form_home"),
-            "form_away": m.get("form_away"),
-            "win_probability": m.get("win_probability"),
-            "feature_source": m.get("feature_source"),
-        }
-        log.info("Feature sample %d: %s", i, json.dumps(snapshot, ensure_ascii=False, default=str))
+    # Return only current-season matches for evaluation
+    # (prev_matches were only used as history context)
+    current_ids = {m["id"] for m in current_matches}
+    result      = [m for m in all_for_history if m["id"] in current_ids]
 
+    log.info("feature_src : historical_self_contained_v2")
+    log.info("Matches for evaluation: %d (current season)", len(result))
 
-def log_strength_distribution(matches: List[Dict[str, Any]]) -> None:
-    strengths = [m["home_strength"] for m in matches if m.get("home_strength") is not None]
-    strengths += [m["away_strength"] for m in matches if m.get("away_strength") is not None]
-    if not strengths:
-        log.warning("No derived strengths available yet. This can happen very early in a season.")
-        return
-    avg_strength = sum(strengths) / len(strengths)
-    log.info(
-        "Derived strength distribution: n=%d min=%.2f avg=%.2f max=%.2f",
-        len(strengths), min(strengths), avg_strength, max(strengths)
-    )
+    # Coverage is logged by enrich_with_historical_features() above.
+    return result
+
 
 
 # ═══════════════════════════════════════════════════════════════
-# SUPABASE WRITE
+# SUPABASE WRITE — model_results
 # ═══════════════════════════════════════════════════════════════
 
-def upsert_results(rows: List[Dict[str, Any]]) -> None:
+def upsert_results(rows: list) -> None:
+    """
+    Upsert backtest records into Supabase `model_results`.
+    Conflict key: (match_id, model_key) — idempotent re-runs.
+    Uses SERVICE_ROLE_KEY — never the anon key.
+    """
     if not rows:
         log.info("No rows to write.")
         return
@@ -709,45 +797,33 @@ def upsert_results(rows: List[Dict[str, Any]]) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 def run_backtest(
-    season: Optional[str] = None,
-    competition: Optional[str] = None,
+    season: str | None = None,
+    competition: str | None = None,
     dry_run: bool = False,
 ) -> None:
     log.info("── Backtest start ──────────────────────────────────")
     log.info("  competition : %s", competition or "all active")
     log.info("  season      : %s", season or "latest")
     log.info("  dry_run     : %s", dry_run)
-    log.info("  feature_src : historical_self_contained")
 
-    system_version = get_system_version()
-    run_id = start_pipeline_run(
+    _sys_version = get_system_version()
+    _run_id      = start_pipeline_run(
         "backtest",
-        system_version=system_version,
-        metadata={
-            "season": season,
-            "competition": competition,
-            "dry_run": dry_run,
-            "feature_source": "historical_self_contained",
-        },
+        system_version=_sys_version,
+        metadata={"season": season, "competition": competition, "dry_run": dry_run},
     )
     register_system_release()
-    log.info("  version     : %s", system_version)
-    log.info("  run_id      : %s", run_id)
+    log.info("  version     : %s", _sys_version)
+    log.info("  run_id      : %s", _run_id)
 
-    raw_matches = fetch_finished_matches(season=season, competition=competition)
-    log.info("Fetched %d finished matches from football-data", len(raw_matches))
-
-    matches = annotate_historical_features(raw_matches)
-    log_feature_coverage(matches)
-    log_strength_distribution(matches)
-    log_match_feature_samples(matches)
+    matches = fetch_finished_matches(season=season, competition=competition)
+    log.info("Fetched %d finished matches for evaluation", len(matches))
 
     if not matches:
         log.warning("No finished matches found — nothing to do.")
-        finish_pipeline_run(run_id, status="success", metadata={"rows_written": 0, "skipped": 0})
         return
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict] = []
     skipped = 0
 
     for m in matches:
@@ -757,8 +833,12 @@ def run_backtest(
             skipped += 1
             continue
 
-        actual_score = f"{actual_h}:{actual_a}"
-        actual_winner = "home" if actual_h > actual_a else ("away" if actual_a > actual_h else "draw")
+        actual_score  = f"{actual_h}:{actual_a}"
+        actual_winner = (
+            "home"  if actual_h > actual_a else
+            "away"  if actual_a > actual_h else
+            "draw"
+        )
 
         for model_key, model_fn in MODELS.items():
             try:
@@ -767,62 +847,111 @@ def run_backtest(
                 log.warning("  [WARN] %s on %s failed: %s", model_key, m.get("id"), exc)
                 continue
 
-            pts = calc_points(result["predicted_score"], actual_h, actual_a)
+            pts     = calc_points(result["predicted_score"], actual_h, actual_a)
             outcome = calc_outcome_label(result["predicted_score"], actual_h, actual_a)
 
+            # ── Extended evaluation metrics ───────────────────
             metrics = compute_eval_metrics(
-                predicted_score=result["predicted_score"],
-                actual_home=actual_h,
-                actual_away=actual_a,
-                prob_home=result.get("prob_home"),
-                prob_draw=result.get("prob_draw"),
-                prob_away=result.get("prob_away"),
+                predicted_score = result["predicted_score"],
+                actual_home     = actual_h,
+                actual_away     = actual_a,
+                prob_home       = result.get("prob_home"),
+                prob_draw       = result.get("prob_draw"),
+                prob_away       = result.get("prob_away"),
             )
 
             rows.append({
-                "match_id": m["id"],
-                "model_key": model_key,
-                "model_version": MODEL_VERSION,
+                "match_id":           m["id"],
+                "model_key":          model_key,
+                "model_version":      MODEL_VERSION,
                 "calibration_version": CALIBRATION_VERSION,
-                "weights_version": WEIGHTS_VERSION,
-                "predicted_score": result["predicted_score"],
-                "predicted_winner": result["predicted_winner"],
-                "confidence_score": result["confidence_score"],
-                "actual_score": actual_score,
-                "actual_winner": actual_winner,
-                "actual_home_goals": actual_h,
-                "actual_away_goals": actual_a,
-                "points": pts,
-                "outcome_label": outcome,
-                "predicted_1x2": metrics.get("predicted_1x2"),
-                "actual_1x2": metrics.get("actual_1x2"),
-                "is_exact_hit": metrics.get("is_exact_hit"),
-                "is_tendency_hit": metrics.get("is_tendency_hit"),
-                "score_error_abs": metrics.get("score_error_abs"),
-                "goal_diff_error": metrics.get("goal_diff_error"),
-                "brier_score_1x2": metrics.get("brier_score_1x2"),
-                "log_loss_1x2": metrics.get("log_loss_1x2"),
-                "home_team": m.get("home_team", ""),
-                "away_team": m.get("away_team", ""),
-                "flag": m.get("flag", ""),
-                "league_abbr": m.get("league_abbr", ""),
-                "competition_code": m.get("competition_code", ""),
-                "season": m.get("season", season or ""),
-                "kickoff_at": m.get("kickoff_at"),
-                "system_version": system_version,
-                "pipeline_run_id": run_id,
+                "weights_version":     WEIGHTS_VERSION,
+                # Prognose
+                "predicted_score":    result["predicted_score"],
+                "predicted_winner":   result["predicted_winner"],
+                "confidence_score":   result["confidence_score"],
+                # Ergebnis
+                "actual_score":       actual_score,
+                "actual_winner":      actual_winner,
+                "actual_home_goals":  actual_h,
+                "actual_away_goals":  actual_a,
+                # Bewertung (bestehend)
+                "points":             pts,
+                "outcome_label":      outcome,
+                # Evaluation Metrics (neu)
+                "predicted_1x2":      metrics.get("predicted_1x2"),
+                "actual_1x2":         metrics.get("actual_1x2"),
+                "is_exact_hit":       metrics.get("is_exact_hit"),
+                "is_tendency_hit":    metrics.get("is_tendency_hit"),
+                "score_error_abs":    metrics.get("score_error_abs"),
+                "goal_diff_error":    metrics.get("goal_diff_error"),
+                "brier_score_1x2":    metrics.get("brier_score_1x2"),
+                "log_loss_1x2":       metrics.get("log_loss_1x2"),
+                # Spielkontext (denormalisiert für Frontend)
+                "home_team":          m.get("home_team", ""),
+                "away_team":          m.get("away_team", ""),
+                "flag":               m.get("flag", ""),
+                "league_abbr":        m.get("league_abbr", ""),
+                "competition_code":   m.get("competition_code", ""),
+                "season":             m.get("season", season or ""),
+                "kickoff_at":         m.get("kickoff_at"),
+                # Versioning — filled below after pipeline_run_id is known:
+                "system_version":  None,
+                "pipeline_run_id": None,
             })
 
     if skipped:
         log.warning("Skipped %d matches with missing actual goals", skipped)
 
-    log.info("Computed %d predictions (%d matches × %d models)", len(rows), len(matches) - skipped, len(MODELS))
+    log.info("Computed %d predictions (%d matches × %d models)",
+             len(rows), len(matches) - skipped, len(MODELS))
+
+    # Inject versioning metadata
+    for r in rows:
+        r["system_version"]  = _sys_version
+        r["pipeline_run_id"] = _run_id
 
     if dry_run:
         log.info("DRY RUN — no Supabase write")
-        print(json.dumps(rows[:3], indent=2, default=str))
+        # Strip internal keys before JSON print
+        sample_clean = [
+            {k: v for k, v in r.items() if not k.startswith("_")}
+            for r in rows[:3]
+        ]
+        print(json.dumps(sample_clean, indent=2, default=str))
 
-        by_model: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        # Feature coverage stats
+        n_tot   = len(matches)
+        s_ok    = sum(1 for m in matches if m.get("home_strength") is not None)
+        f_ok    = sum(1 for m in matches if m.get("form_home"))
+        cs_used = sum(1 for m in matches if m.get("_n_home_matches", 0) > 0
+                      or m.get("_n_away_matches", 0) > 0)
+        if n_tot > 0:
+            print(f"\n── Feature Coverage (dry run) ────────────────")
+            print(f"  feature_src     : {matches[0].get('feature_src', '?')  if matches else '?'}")    
+            print(f"  strength ok     : {s_ok}/{n_tot} ({s_ok/n_tot*100:.0f}%)")
+            print(f"  form ok         : {f_ok}/{n_tot} ({f_ok/n_tot*100:.0f}%)")
+            print(f"  historical data : {cs_used}/{n_tot} matches had history")
+            # Sample with history
+            for m in matches[:5]:
+                hn   = m.get('_n_home_matches', 0)
+                an   = m.get('_n_away_matches', 0)
+                hs   = f"{m.get('home_strength'):.1f}" if m.get('home_strength') is not None else 'null'
+                as_  = f"{m.get('away_strength'):.1f}" if m.get('away_strength') is not None else 'null'
+                print(f"  sample  : {m.get('home_team','?')[:15]} vs {m.get('away_team','?')[:15]}")
+                print(f"    home_strength       : {hs}")
+                print(f"    away_strength       : {as_}")
+                print(f"    history_home_matches: {hn}")
+                print(f"    history_away_matches: {an}")
+                print(f"    form_home           : {m.get('form_home',[])}")
+                print(f"    form_away           : {m.get('form_away',[])}")
+                print(f"    win_probability     : {m.get('win_probability', 50)}")
+                print()
+
+
+        # ── Per-model summary (dry run) ───────────────────
+        from collections import defaultdict
+        by_model: dict[str, list] = defaultdict(list)
         for r in rows:
             by_model[r["model_key"]].append(r)
 
@@ -831,17 +960,21 @@ def run_backtest(
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
         for mk, rlist in sorted(by_model.items()):
-            n = len(rlist)
-            avg_pts = sum(r["points"] for r in rlist) / n if n else 0.0
-            tend_n = [r for r in rlist if r.get("is_tendency_hit") is not None]
-            tend_pct = (sum(1 for r in tend_n if r["is_tendency_hit"]) / len(tend_n) * 100.0) if tend_n else float("nan")
-            exact_n = [r for r in rlist if r.get("is_exact_hit") is not None]
-            exact_pct = (sum(1 for r in exact_n if r["is_exact_hit"]) / len(exact_n) * 100.0) if exact_n else float("nan")
-            err_vals = [r["score_error_abs"] for r in rlist if r.get("score_error_abs") is not None]
-            avg_err = sum(err_vals) / len(err_vals) if err_vals else float("nan")
-            brier_vals = [r["brier_score_1x2"] for r in rlist if r.get("brier_score_1x2") is not None]
-            avg_brier = sum(brier_vals) / len(brier_vals) if brier_vals else None
-            brier_str = f"{avg_brier:9.4f}" if avg_brier is not None else "      n/a"
+            n          = len(rlist)
+            avg_pts    = sum(r["points"] for r in rlist) / n if n else 0
+            tend_n     = [r for r in rlist if r.get("is_tendency_hit") is not None]
+            tend_pct   = (sum(1 for r in tend_n if r["is_tendency_hit"]) /
+                          len(tend_n) * 100) if tend_n else float("nan")
+            exact_n    = [r for r in rlist if r.get("is_exact_hit") is not None]
+            exact_pct  = (sum(1 for r in exact_n if r["is_exact_hit"]) /
+                          len(exact_n) * 100) if exact_n else float("nan")
+            err_vals   = [r["score_error_abs"] for r in rlist
+                          if r.get("score_error_abs") is not None]
+            avg_err    = sum(err_vals) / len(err_vals) if err_vals else float("nan")
+            brier_vals = [r["brier_score_1x2"] for r in rlist
+                          if r.get("brier_score_1x2") is not None]
+            avg_brier  = sum(brier_vals) / len(brier_vals) if brier_vals else None
+            brier_str  = f"{avg_brier:9.4f}" if avg_brier is not None else "      n/a"
             print(
                 f"  {mk:<12s}  {n:>4d}  {avg_pts:7.2f}  "
                 f"{tend_pct:6.1f}  {exact_pct:6.1f}  {avg_err:7.2f}  {brier_str}"
@@ -851,24 +984,20 @@ def run_backtest(
 
     log.info("── Backtest done ───────────────────────────────────")
     finish_pipeline_run(
-        run_id,
+        _run_id,
         status="success" if not dry_run else "dry_run",
-        metadata={
-            "rows_written": len(rows),
-            "skipped": skipped,
-            "feature_source": "historical_self_contained",
-        },
+        metadata={"rows_written": len(rows), "skipped": skipped},
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="EuroMatch Edge — historischer Self-Contained Backtest-Runner",
+        description="EuroMatch Edge — Serverseitiger Backtest-Runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Beispiele:
   python backtest.py --dry-run
-  python backtest.py --competition BUNDESLIGA --season 2025
+  python backtest.py --competition BUNDESLIGA --season 2024
   python backtest.py --competition PREMIER_LEAGUE --dry-run
 
 Bekannte competition-Codes:
@@ -877,7 +1006,7 @@ Bekannte competition-Codes:
     parser.add_argument(
         "--season",
         default=None,
-        help="Saison-Jahr, z.B. '2025' oder '2025/26' (nur Jahr-Teil wird genutzt)",
+        help="Saison-Jahr, z.B. '2024' oder '2024/25' (nur Jahr-Teil wird genutzt)",
     )
     parser.add_argument(
         "--competition",
