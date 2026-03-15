@@ -121,6 +121,9 @@ HEADERS_WRITE = {
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 REQUEST_DELAY_S    = 7     # free tier: 10 req/min — 7 s gap is safe
 DEBUG_FEATURE_SAMPLE_LIMIT = int(os.environ.get("BACKTEST_DEBUG_FEATURE_SAMPLE_LIMIT", "5"))
+DEFAULT_MIN_STRENGTH_COVERAGE = float(os.environ.get("BACKTEST_MIN_STRENGTH_COVERAGE", "0.80"))
+DEFAULT_MIN_FORM_COVERAGE     = float(os.environ.get("BACKTEST_MIN_FORM_COVERAGE", "0.80"))
+DEFAULT_MIN_MARKET_COVERAGE   = float(os.environ.get("BACKTEST_MIN_MARKET_COVERAGE", "0.00"))
 
 # Internal competition_code → football-data.org source_code
 # Mirrors config.py so backtest.py has no import dependency on it.
@@ -431,7 +434,21 @@ def fetch_supabase_enrichment(competition_code: str | None = None) -> dict:
         params.append(("competition_code", f"eq.{competition_code}"))
 
     rows = _supabase_get("matches", params)
-    log.info("Supabase enrichment: %d rows loaded", len(rows))
+
+    with_strengths = sum(
+        1 for row in rows
+        if row.get("home_strength") is not None and row.get("away_strength") is not None
+    )
+    with_form = sum(
+        1 for row in rows
+        if bool(row.get("form_home")) and bool(row.get("form_away"))
+    )
+    with_market = sum(1 for row in rows if row.get("market_home_win_odds") is not None)
+
+    log.info(
+        "Supabase enrichment: %d rows loaded (strengths=%d, form=%d, market_odds=%d)",
+        len(rows), with_strengths, with_form, with_market,
+    )
     return {row["external_id"]: row for row in rows if row.get("external_id")}
 
 
@@ -651,23 +668,31 @@ def log_match_feature_samples(matches: list[dict], limit: int = DEBUG_FEATURE_SA
             "away_team": m.get("away_team"),
             "home_strength": m.get("home_strength"),
             "away_strength": m.get("away_strength"),
-            "form_home": m.get("form_home"),
-            "form_away": m.get("form_away"),
+            "form_home": m.get("form_home") or [],
+            "form_away": m.get("form_away") or [],
             "market_home_win_odds": m.get("market_home_win_odds"),
             "win_probability": m.get("win_probability"),
         }
-        log.info("Feature sample %d: %s", i, json.dumps(snapshot, default=str, ensure_ascii=False))
+        log.info("Feature sample %d: %s", i, json.dumps(snapshot, ensure_ascii=False, default=str))
 
 
-def log_feature_coverage(matches: list[dict]) -> None:
+def compute_feature_coverage(matches: list[dict]) -> dict:
     """
     Aggregate visibility for enrichment coverage across the fetched match set.
-    This helps identify silent fallback/default behaviour in the models.
+    Returns absolute counts plus fractional coverage for model-critical fields.
     """
-    if not matches:
-        return
-
     total = len(matches)
+    if total == 0:
+        return {
+            "total": 0,
+            "with_strengths": 0,
+            "with_form": 0,
+            "with_market": 0,
+            "strength_cov": 0.0,
+            "form_cov": 0.0,
+            "market_cov": 0.0,
+        }
+
     with_strengths = sum(
         1 for m in matches
         if m.get("home_strength") is not None and m.get("away_strength") is not None
@@ -678,12 +703,76 @@ def log_feature_coverage(matches: list[dict]) -> None:
     )
     with_market = sum(1 for m in matches if m.get("market_home_win_odds") is not None)
 
+    return {
+        "total": total,
+        "with_strengths": with_strengths,
+        "with_form": with_form,
+        "with_market": with_market,
+        "strength_cov": with_strengths / total,
+        "form_cov": with_form / total,
+        "market_cov": with_market / total,
+    }
+
+
+def log_feature_coverage(matches: list[dict]) -> dict:
+    """
+    Log feature coverage and return the computed coverage summary.
+    """
+    coverage = compute_feature_coverage(matches)
+    total = coverage["total"]
+    if total == 0:
+        log.info("Feature coverage: no matches loaded")
+        return coverage
+
     log.info(
         "Feature coverage: strengths=%d/%d (%.1f%%), form=%d/%d (%.1f%%), market_odds=%d/%d (%.1f%%)",
-        with_strengths, total, with_strengths / total * 100.0,
-        with_form, total, with_form / total * 100.0,
-        with_market, total, with_market / total * 100.0,
+        coverage["with_strengths"], total, coverage["strength_cov"] * 100.0,
+        coverage["with_form"], total, coverage["form_cov"] * 100.0,
+        coverage["with_market"], total, coverage["market_cov"] * 100.0,
     )
+
+    if coverage["strength_cov"] < 0.80 or coverage["form_cov"] < 0.80:
+        log.warning(
+            "Low feature coverage detected — model outputs may collapse to fallback/default scores. "
+            "strength_cov=%.1f%% form_cov=%.1f%% market_cov=%.1f%%",
+            coverage["strength_cov"] * 100.0,
+            coverage["form_cov"] * 100.0,
+            coverage["market_cov"] * 100.0,
+        )
+
+    return coverage
+
+
+def enforce_feature_coverage_or_raise(
+    coverage: dict,
+    *,
+    min_strength_coverage: float,
+    min_form_coverage: float,
+    min_market_coverage: float,
+) -> None:
+    """
+    Abort the backtest if feature coverage is too low for meaningful evaluation.
+    Market coverage is optional; pass 0.0 to disable that threshold.
+    """
+    failures: list[str] = []
+
+    if coverage.get("strength_cov", 0.0) < min_strength_coverage:
+        failures.append(
+            f"strengths {coverage.get('strength_cov', 0.0):.1%} < required {min_strength_coverage:.1%}"
+        )
+    if coverage.get("form_cov", 0.0) < min_form_coverage:
+        failures.append(
+            f"form {coverage.get('form_cov', 0.0):.1%} < required {min_form_coverage:.1%}"
+        )
+    if min_market_coverage > 0.0 and coverage.get("market_cov", 0.0) < min_market_coverage:
+        failures.append(
+            f"market_odds {coverage.get('market_cov', 0.0):.1%} < required {min_market_coverage:.1%}"
+        )
+
+    if failures:
+        raise RuntimeError(
+            "Backtest aborted due to insufficient feature coverage: " + "; ".join(failures)
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -724,11 +813,16 @@ def run_backtest(
     season: str | None = None,
     competition: str | None = None,
     dry_run: bool = False,
+    enforce_feature_coverage: bool = False,
+    min_strength_coverage: float = DEFAULT_MIN_STRENGTH_COVERAGE,
+    min_form_coverage: float = DEFAULT_MIN_FORM_COVERAGE,
+    min_market_coverage: float = DEFAULT_MIN_MARKET_COVERAGE,
 ) -> None:
     log.info("── Backtest start ──────────────────────────────────")
     log.info("  competition : %s", competition or "all active")
     log.info("  season      : %s", season or "latest")
     log.info("  dry_run     : %s", dry_run)
+    log.info("  enforce_cov : %s", enforce_feature_coverage)
 
     _sys_version = get_system_version()
     _run_id      = start_pipeline_run(
@@ -742,8 +836,16 @@ def run_backtest(
 
     matches = fetch_finished_matches(season=season, competition=competition)
     log.info("Fetched %d finished matches", len(matches))
-    log_feature_coverage(matches)
+    coverage = log_feature_coverage(matches)
     log_match_feature_samples(matches)
+
+    if enforce_feature_coverage:
+        enforce_feature_coverage_or_raise(
+            coverage,
+            min_strength_coverage=min_strength_coverage,
+            min_form_coverage=min_form_coverage,
+            min_market_coverage=min_market_coverage,
+        )
 
     if not matches:
         log.warning("No finished matches found — nothing to do.")
@@ -911,5 +1013,36 @@ Bekannte competition-Codes:
         action="store_true",
         help="Berechnen ohne Supabase-Write. Gibt Sample-Output und Punktzusammenfassung aus.",
     )
+    parser.add_argument(
+        "--enforce-feature-coverage",
+        action="store_true",
+        help="Backtest abbrechen, wenn die Coverage für Strength/Form/Market unter den Mindestschwellen liegt.",
+    )
+    parser.add_argument(
+        "--min-strength-coverage",
+        type=float,
+        default=DEFAULT_MIN_STRENGTH_COVERAGE,
+        help=f"Mindestabdeckung für home/away_strength (Default: {DEFAULT_MIN_STRENGTH_COVERAGE:.2f})",
+    )
+    parser.add_argument(
+        "--min-form-coverage",
+        type=float,
+        default=DEFAULT_MIN_FORM_COVERAGE,
+        help=f"Mindestabdeckung für form_home/form_away (Default: {DEFAULT_MIN_FORM_COVERAGE:.2f})",
+    )
+    parser.add_argument(
+        "--min-market-coverage",
+        type=float,
+        default=DEFAULT_MIN_MARKET_COVERAGE,
+        help=f"Mindestabdeckung für market_home_win_odds (Default: {DEFAULT_MIN_MARKET_COVERAGE:.2f}) — 0 deaktiviert die Prüfung.",
+    )
     args = parser.parse_args()
-    run_backtest(season=args.season, competition=args.competition, dry_run=args.dry_run)
+    run_backtest(
+        season=args.season,
+        competition=args.competition,
+        dry_run=args.dry_run,
+        enforce_feature_coverage=args.enforce_feature_coverage,
+        min_strength_coverage=args.min_strength_coverage,
+        min_form_coverage=args.min_form_coverage,
+        min_market_coverage=args.min_market_coverage,
+    )
