@@ -51,6 +51,8 @@ import argparse
 import logging
 import math
 import time
+import re
+import unicodedata
 from urllib.parse import urlencode
 
 import requests
@@ -121,6 +123,8 @@ HEADERS_WRITE = {
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 REQUEST_DELAY_S    = 7     # free tier: 10 req/min — 7 s gap is safe
 DEBUG_FEATURE_SAMPLE_LIMIT = int(os.environ.get("BACKTEST_DEBUG_FEATURE_SAMPLE_LIMIT", "5"))
+DEBUG_ENRICHMENT_SAMPLE_LIMIT = int(os.environ.get("BACKTEST_DEBUG_ENRICHMENT_SAMPLE_LIMIT", "5"))
+DEBUG_UNMATCHED_SAMPLE_LIMIT = int(os.environ.get("BACKTEST_DEBUG_UNMATCHED_SAMPLE_LIMIT", "10"))
 DEFAULT_MIN_STRENGTH_COVERAGE = float(os.environ.get("BACKTEST_MIN_STRENGTH_COVERAGE", "0.80"))
 DEFAULT_MIN_FORM_COVERAGE     = float(os.environ.get("BACKTEST_MIN_FORM_COVERAGE", "0.80"))
 DEFAULT_MIN_MARKET_COVERAGE   = float(os.environ.get("BACKTEST_MIN_MARKET_COVERAGE", "0.00"))
@@ -378,6 +382,57 @@ def market(m: dict) -> dict:
             "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
 
 
+def normalize_team_name(name: str | None) -> str:
+    """Create a stable, ASCII-safe team key for fallback matching."""
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode("ascii")
+    s = s.lower().strip()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def date_key(value: str | None) -> str:
+    """Return YYYY-MM-DD from an ISO timestamp/date string."""
+    if not value:
+        return ""
+    return str(value)[:10]
+
+
+def build_fallback_match_key(*, competition_code: str | None, kickoff_at: str | None, home_team: str | None, away_team: str | None) -> str:
+    """Fallback key when external_id is missing or not aligned across sources."""
+    return "|".join([
+        competition_code or "",
+        date_key(kickoff_at),
+        normalize_team_name(home_team),
+        normalize_team_name(away_team),
+    ])
+
+
+def log_enrichment_samples(rows: list[dict], limit: int = DEBUG_ENRICHMENT_SAMPLE_LIMIT) -> None:
+    if not rows or limit <= 0:
+        return
+
+    log.info("Supabase enrichment sample (first %d rows)", min(limit, len(rows)))
+    for i, row in enumerate(rows[:limit], start=1):
+        snapshot = {
+            "idx": i,
+            "external_id": row.get("external_id"),
+            "competition_code": row.get("competition_code"),
+            "kickoff_at": row.get("kickoff_at"),
+            "home_team": row.get("home_team"),
+            "away_team": row.get("away_team"),
+            "home_strength": row.get("home_strength"),
+            "away_strength": row.get("away_strength"),
+            "form_home": row.get("form_home") or [],
+            "form_away": row.get("form_away") or [],
+            "market_home_win_odds": row.get("market_home_win_odds"),
+        }
+        log.info("Enrichment sample %d: %s", i, json.dumps(snapshot, ensure_ascii=False, default=str))
+
+
 # ═══════════════════════════════════════════════════════════════
 # SUPABASE HELPERS — reads only, full error context on failure
 # ═══════════════════════════════════════════════════════════════
@@ -418,13 +473,14 @@ def fetch_supabase_enrichment(competition_code: str | None = None) -> dict:
     """
     Load model input data + display metadata from Supabase `matches`.
 
-    Only queries columns that ACTUALLY EXIST in the schema.
-    Returns dict: external_id → row  (e.g. "football_data_12345" → {...})
+    Returns a structured lookup with:
+      - rows: raw Supabase rows
+      - by_external_id: direct lookup via external_id
+      - by_fallback_key: fallback lookup via competition+date+teams
     """
     params = [
-        # Request only known columns — avoids HTTP 400 from unknown columns
         ("select", "external_id,competition_code,league_abbr,flag,"
-                   "home_team,away_team,"
+                   "home_team,away_team,kickoff_at,"
                    "home_strength,away_strength,"
                    "form_home,form_away,"
                    "market_home_win_odds"),
@@ -445,11 +501,50 @@ def fetch_supabase_enrichment(competition_code: str | None = None) -> dict:
     )
     with_market = sum(1 for row in rows if row.get("market_home_win_odds") is not None)
 
+    by_external_id: dict[str, dict] = {}
+    by_fallback_key: dict[str, dict] = {}
+    duplicate_external_ids = 0
+    duplicate_fallback_keys = 0
+
+    for row in rows:
+        external_id = row.get("external_id")
+        if external_id:
+            if external_id in by_external_id:
+                duplicate_external_ids += 1
+            by_external_id[external_id] = row
+
+        fallback_key = build_fallback_match_key(
+            competition_code=row.get("competition_code"),
+            kickoff_at=row.get("kickoff_at"),
+            home_team=row.get("home_team"),
+            away_team=row.get("away_team"),
+        )
+        if fallback_key.strip("|"):
+            if fallback_key in by_fallback_key:
+                duplicate_fallback_keys += 1
+            by_fallback_key[fallback_key] = row
+
     log.info(
-        "Supabase enrichment: %d rows loaded (strengths=%d, form=%d, market_odds=%d)",
-        len(rows), with_strengths, with_form, with_market,
+        "Supabase enrichment: %d rows loaded (strengths=%d, form=%d, market_odds=%d, by_external_id=%d, by_fallback_key=%d)",
+        len(rows), with_strengths, with_form, with_market, len(by_external_id), len(by_fallback_key),
     )
-    return {row["external_id"]: row for row in rows if row.get("external_id")}
+    if duplicate_external_ids:
+        log.warning("Supabase enrichment contains %d duplicate external_id rows", duplicate_external_ids)
+    if duplicate_fallback_keys:
+        log.warning("Supabase enrichment contains %d duplicate fallback keys", duplicate_fallback_keys)
+    if rows and len(rows) < 25:
+        log.warning(
+            "Very low Supabase enrichment row count (%d). This usually indicates a restrictive filter, current-state-only data, or missing historical rows.",
+            len(rows),
+        )
+
+    log_enrichment_samples(rows)
+
+    return {
+        "rows": rows,
+        "by_external_id": by_external_id,
+        "by_fallback_key": by_fallback_key,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -503,6 +598,9 @@ def fetch_finished_from_api(
     if enrichment is None:
         enrichment = fetch_supabase_enrichment(competition_code)
 
+    enrichment_by_external_id = enrichment.get("by_external_id", {})
+    enrichment_by_fallback_key = enrichment.get("by_fallback_key", {})
+
     # Determine which competitions to request
     if competition_code:
         if competition_code not in COMP_CODE_TO_SOURCE:
@@ -526,6 +624,10 @@ def fetch_finished_from_api(
             log.warning("Could not parse season year from '%s' — ignoring", season)
 
     all_matches: list[dict] = []
+    matched_external = 0
+    matched_fallback = 0
+    unmatched_count = 0
+    unmatched_samples: list[dict] = []
 
     for comp_code, fd_source in comps.items():
         params: dict = {"status": "FINISHED", "limit": 100}
@@ -576,19 +678,48 @@ def fetch_finished_from_api(
 
             fd_match_id = raw.get("id")
             external_id = f"football_data_{fd_match_id}"
-            enrich      = enrichment.get(external_id, {})
 
-            if not enrich:
-                log.debug(
-                    "No Supabase enrichment for %s — model inputs will use defaults",
-                    external_id,
-                )
-
-            # Extract team names from football-data.org (fallback when Supabase enrichment missing)
             raw_home = raw.get("homeTeam", {})
             raw_away = raw.get("awayTeam", {})
-            home_name = enrich.get("home_team") or raw_home.get("name") or raw_home.get("shortName") or "?"
-            away_name = enrich.get("away_team") or raw_away.get("name") or raw_away.get("shortName") or "?"
+            api_home_name = raw_home.get("name") or raw_home.get("shortName") or "?"
+            api_away_name = raw_away.get("name") or raw_away.get("shortName") or "?"
+
+            enrich = enrichment_by_external_id.get(external_id)
+            enrich_match_source = None
+
+            if enrich:
+                enrich_match_source = "external_id"
+                matched_external += 1
+            else:
+                fallback_key = build_fallback_match_key(
+                    competition_code=comp_code,
+                    kickoff_at=raw.get("utcDate"),
+                    home_team=api_home_name,
+                    away_team=api_away_name,
+                )
+                enrich = enrichment_by_fallback_key.get(fallback_key, {})
+                if enrich:
+                    enrich_match_source = "fallback_team_date"
+                    matched_fallback += 1
+                else:
+                    unmatched_count += 1
+                    if len(unmatched_samples) < DEBUG_UNMATCHED_SAMPLE_LIMIT:
+                        unmatched_samples.append({
+                            "external_id": external_id,
+                            "competition_code": comp_code,
+                            "kickoff_at": raw.get("utcDate"),
+                            "home_team_api": api_home_name,
+                            "away_team_api": api_away_name,
+                            "fallback_key": fallback_key,
+                        })
+                    log.debug(
+                        "No Supabase enrichment for %s — model inputs will use defaults",
+                        external_id,
+                    )
+
+            # Extract team names from football-data.org (fallback when Supabase enrichment missing)
+            home_name = enrich.get("home_team") or api_home_name
+            away_name = enrich.get("away_team") or api_away_name
 
             all_matches.append({
                 # ── Identity ──────────────────────────────────────
@@ -616,6 +747,7 @@ def fetch_finished_from_api(
                 # market_home_win_odds is the column name in Supabase;
                 # the market model also accepts market_signal_home as fallback.
                 "market_home_win_odds": enrich.get("market_home_win_odds"),
+                "enrich_match_source": enrich_match_source or "none",
 
                 # win_probability not available for historic matches —
                 # ensemble model falls back to strength+form only.
@@ -628,6 +760,15 @@ def fetch_finished_from_api(
             })
 
         time.sleep(REQUEST_DELAY_S)
+
+    log.info(
+        "Enrichment join summary: external_id=%d, fallback_team_date=%d, unmatched=%d",
+        matched_external, matched_fallback, unmatched_count,
+    )
+    if unmatched_samples:
+        log.info("Unmatched football-data samples (first %d)", len(unmatched_samples))
+        for i, sample in enumerate(unmatched_samples, start=1):
+            log.info("Unmatched sample %d: %s", i, json.dumps(sample, ensure_ascii=False, default=str))
 
     return all_matches
 
@@ -672,6 +813,7 @@ def log_match_feature_samples(matches: list[dict], limit: int = DEBUG_FEATURE_SA
             "form_away": m.get("form_away") or [],
             "market_home_win_odds": m.get("market_home_win_odds"),
             "win_probability": m.get("win_probability"),
+            "enrich_match_source": m.get("enrich_match_source"),
         }
         log.info("Feature sample %d: %s", i, json.dumps(snapshot, ensure_ascii=False, default=str))
 
@@ -688,6 +830,9 @@ def compute_feature_coverage(matches: list[dict]) -> dict:
             "with_strengths": 0,
             "with_form": 0,
             "with_market": 0,
+            "matched_external": 0,
+            "matched_fallback": 0,
+            "matched_none": 0,
             "strength_cov": 0.0,
             "form_cov": 0.0,
             "market_cov": 0.0,
@@ -703,11 +848,18 @@ def compute_feature_coverage(matches: list[dict]) -> dict:
     )
     with_market = sum(1 for m in matches if m.get("market_home_win_odds") is not None)
 
+    matched_external = sum(1 for m in matches if m.get("enrich_match_source") == "external_id")
+    matched_fallback = sum(1 for m in matches if m.get("enrich_match_source") == "fallback_team_date")
+    matched_none = sum(1 for m in matches if m.get("enrich_match_source") in (None, "none"))
+
     return {
         "total": total,
         "with_strengths": with_strengths,
         "with_form": with_form,
         "with_market": with_market,
+        "matched_external": matched_external,
+        "matched_fallback": matched_fallback,
+        "matched_none": matched_none,
         "strength_cov": with_strengths / total,
         "form_cov": with_form / total,
         "market_cov": with_market / total,
@@ -729,6 +881,12 @@ def log_feature_coverage(matches: list[dict]) -> dict:
         coverage["with_strengths"], total, coverage["strength_cov"] * 100.0,
         coverage["with_form"], total, coverage["form_cov"] * 100.0,
         coverage["with_market"], total, coverage["market_cov"] * 100.0,
+    )
+    log.info(
+        "Enrichment match sources: external_id=%d/%d (%.1f%%), fallback_team_date=%d/%d (%.1f%%), unmatched=%d/%d (%.1f%%)",
+        coverage["matched_external"], total, (coverage["matched_external"] / total) * 100.0,
+        coverage["matched_fallback"], total, (coverage["matched_fallback"] / total) * 100.0,
+        coverage["matched_none"], total, (coverage["matched_none"] / total) * 100.0,
     )
 
     if coverage["strength_cov"] < 0.80 or coverage["form_cov"] < 0.80:
