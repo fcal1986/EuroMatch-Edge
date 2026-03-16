@@ -180,7 +180,9 @@ def map_match(raw: dict[str, Any], source_code: str) -> dict[str, Any] | None:
         "load_away":             None,
         "motivation_home":       None,
         "motivation_away":       None,
-        "market_home_win_odds":  None,
+        "market_home_win_odds":  None,   # Heimsieg-Quote
+        "market_draw_odds":       None,   # Remis-Quote (ergänzt)
+        "market_away_odds":       None,   # Auswärtssieg-Quote (ergänzt)
         "weather":               None,
 
         # ── Herkunft
