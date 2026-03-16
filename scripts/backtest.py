@@ -296,6 +296,16 @@ def top_scores(grid: dict, n: int = 2) -> list:
     return sorted(grid.items(), key=lambda x: x[1], reverse=True)[:n]
 
 
+# ── Winner-Schwellenwerte (kalibriert 2026-03) ──────────────────────
+# Bias-Analyse: DC prognostizierte 76% Heimsiege, real sind es 44%.
+# Ursache: argmax(p_home, p_draw, p_away) gibt selten Draw weil
+# draw_prob im Poisson-Grid strukturell < home_prob liegt.
+# Fix: asymmetrische Schwellen kalibriert auf europäische Basisraten:
+#   Home: 44%, Draw: 25%, Away: 31%
+WINNER_HOME_THRESHOLD = 0.45   # home gewinnt wenn p_home ≥ 0.45
+WINNER_AWAY_THRESHOLD = 0.32   # away gewinnt wenn p_away ≥ 0.32
+# Asymmetrie: Home-Schwelle > Away-Schwelle (Heimvorteil ist real)
+
 def winner_from_grid(grid: dict) -> str:
     p_home = p_away = p_draw = 0.0
     for score, prob in grid.items():
@@ -303,8 +313,10 @@ def winner_from_grid(grid: dict) -> str:
         if h > a:   p_home += prob
         elif a > h: p_away += prob
         else:       p_draw += prob
-    if p_home >= p_away and p_home >= p_draw: return "home"
-    if p_away >= p_home and p_away >= p_draw: return "away"
+    # Kalibrierte Schwellen statt reinem argmax
+    # → verhindert dass Draw nie vorhergesagt wird
+    if p_home >= WINNER_HOME_THRESHOLD: return "home"
+    if p_away >= WINNER_AWAY_THRESHOLD: return "away"
     return "draw"
 
 
@@ -937,6 +949,10 @@ def fetch_finished_matches(
             years = [d.year for d in inferred_dates]
             season_year = str(max(set(years), key=years.count))
             log.info("Season year inferred from match dates: %s", season_year)
+            # Backfill season into match dicts that were built with season=""
+            for m in current_matches:
+                if not m.get("season"):
+                    m["season"] = season_year
 
     prev_year = prev_season_year(season_year)
 
