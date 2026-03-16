@@ -54,9 +54,11 @@ VENUE_BLEND_GENERAL = 0.60
 VENUE_BLEND_VENUE   = 0.40
 
 # Heimvorteil-Anpassung wenn venue-Stärke nicht verfügbar
-# Basierend auf europäischem Top-Liga-Durchschnitt: ~+5 Punkte Heimvorteil
-HOME_ADVANTAGE_BONUS = 3.0   # addiert auf home_strength wenn keine Venue-Daten
-AWAY_DISADVANTAGE    = -3.0  # subtrahiert von away_strength wenn keine Venue-Daten
+# KALIBRIERT 2026-03: Bias-Analyse zeigte 76% Home-Prognosen vs. 44% real.
+# Der venue-split (60% general + 40% venue-spez.) kodiert Heimvorteil bereits.
+# Ein zusätzlicher Bonus war Double-Counting → auf 0 gesetzt.
+HOME_ADVANTAGE_BONUS = 0.0   # war 3.0 — venue-split reicht
+AWAY_DISADVANTAGE    = 0.0   # war -3.0 — venue-split reicht
 
 # Normalisierung
 PPG_MAX             = 3.0
