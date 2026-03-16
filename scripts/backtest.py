@@ -92,6 +92,22 @@ except ImportError:
     def prev_season_year(s): return None
     _HISTORICAL_FEATURES_AVAILABLE = False
 
+# Kalibrierungsschicht (P4)
+try:
+    from utils.calibration import (
+        calibrate_dc_probs,
+        load_calibration_from_results,
+        identity_calibration,
+        CalibrationParams,
+    )
+    _CALIBRATION_AVAILABLE = True
+except ImportError:
+    log.warning("utils.calibration not found — keine DC-Kalibrierung.")
+    def calibrate_dc_probs(ph, pd, pa, cal): return ph, pd, pa  # noqa
+    def load_calibration_from_results(rows, v="identity"): return None  # noqa
+    def identity_calibration(): return None  # noqa
+    _CALIBRATION_AVAILABLE = False
+
 # Evaluation Metrics Layer
 try:
     from utils.eval_metrics import (
@@ -307,6 +323,12 @@ MODELS: dict = {}
 ENSEMBLE_ENABLED: bool = False
 PRIMARY_MODEL:    str  = "dc"
 
+# Kalibrierungsparameter für DC (P4)
+# Wird in run_backtest() nach dem ersten Durchlauf befüllt.
+# Erster Lauf: identity_calibration() (T=1.0 = keine Änderung).
+# Folgeläufe: Temperature aus Backtest-Daten geschätzt.
+DC_CALIBRATION: "CalibrationParams | None" = None
+
 def register_model(fn):
     """Decorator: registriert ein Modell in MODELS.
     Respektiert ENSEMBLE_ENABLED — wenn False, wird das Ensemble
@@ -322,21 +344,111 @@ def register_model(fn):
 
 @register_model
 def ensemble(m: dict) -> dict:
-    diff     = strength_diff(m)
-    form_h   = form_score(m.get("form_home") or [])
-    form_a   = form_score(m.get("form_away") or [])
-    form_adv = form_h - form_a
-    raw      = (m.get("win_probability", 50) / 100) * 0.6 + (0.5 + diff * 0.25 + form_adv * 0.15)
-    home_p   = min(0.95, max(0.05, raw / 1.6))
-    winner   = "home" if home_p > 0.55 else ("away" if home_p < 0.40 else "draw")
-    conf     = int(50 + abs(home_p - 0.5) * 80)
-    hg       = 1.2 + diff * 1.5 + form_adv * 0.5
-    ag       = 0.7 - diff * 0.8 + (1 - form_adv) * 0.3
-    main_tip = f"{max(0, round(hg))}:{max(0, round(ag))}"
-    _ph, _pd, _pa = probs_from_home_probability(home_p)
-    return {"predicted_winner": winner, "predicted_score": main_tip,
-            "confidence_score": min(99, conf),
-            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
+    """
+    P5 — Gated Ensemble (regelbasiert, nicht heuristisch).
+
+    Strategie: DC ist Primary. Market und Poisson werden als Signal
+    eingeblendet wenn Datenqualität das rechtfertigt.
+
+    Gewichtungsregeln:
+      Gate A — Markt komplett (3 Quoten) + frisch:
+        DC 60%, Market 30%, Poisson 10%
+      Gate B — Nur Home-Quote vorhanden:
+        DC 70%, Market 20%, Poisson 10%
+      Gate C — Kein Markt:
+        DC 80%, Poisson 20%
+      Gate D — Keine/wenig Historie (Aufsteiger etc.):
+        DC 100% (Fallback auf Stärke-Grundlage)
+
+    Jedes Modell wird direkt aufgerufen (keine doppelte API-Anfrage).
+    ENSEMBLE_ENABLED=False → diese Funktion wird nicht in MODELS registriert.
+    """
+    # ── Gate-Bedingungen prüfen ───────────────────────────────────
+    has_home_odds  = bool(m.get("market_home_win_odds") and
+                          m.get("market_home_win_odds", 0) > 1.0)
+    has_full_odds  = (has_home_odds and
+                      bool(m.get("market_draw_odds") and
+                           m.get("market_draw_odds", 0) > 1.0) and
+                      bool(m.get("market_away_odds") and
+                           m.get("market_away_odds", 0) > 1.0))
+    has_history    = (m.get("home_strength") is not None and
+                      m.get("away_strength") is not None)
+
+    # ── Basis-Modelle aufrufen ────────────────────────────────────
+    dc_result  = dc(m)
+    poi_result = poisson(m)
+
+    dc_ph  = dc_result.get("prob_home")  or 0.0
+    dc_pd  = dc_result.get("prob_draw")  or 0.0
+    dc_pa  = dc_result.get("prob_away")  or 0.0
+    poi_ph = poi_result.get("prob_home") or 0.0
+    poi_pd = poi_result.get("prob_draw") or 0.0
+    poi_pa = poi_result.get("prob_away") or 0.0
+
+    # ── Gate D: keine Historie → DC als alleiniger Fallback ──────
+    if not has_history:
+        return dc_result
+
+    # ── Markt-Wahrscheinlichkeiten wenn vorhanden ─────────────────
+    mkt_ph = mkt_pd = mkt_pa = None
+    if has_home_odds:
+        mkt_result = market(m)
+        mkt_ph = mkt_result.get("prob_home") or 0.0
+        mkt_pd = mkt_result.get("prob_draw") or 0.0
+        mkt_pa = mkt_result.get("prob_away") or 0.0
+
+    # ── Gewichte nach Gate ────────────────────────────────────────
+    if has_full_odds:
+        # Gate A: vollständige 3-Wege-Quoten
+        w_dc, w_mkt, w_poi = 0.60, 0.30, 0.10
+    elif has_home_odds:
+        # Gate B: nur Home-Quote
+        w_dc, w_mkt, w_poi = 0.70, 0.20, 0.10
+    else:
+        # Gate C: kein Markt
+        w_dc, w_mkt, w_poi = 0.80, 0.00, 0.20
+
+    # ── Gewichteter Wahrscheinlichkeitsmix ────────────────────────
+    if mkt_ph is not None:
+        p_home = w_dc * dc_ph + w_mkt * mkt_ph + w_poi * poi_ph
+        p_draw = w_dc * dc_pd + w_mkt * mkt_pd + w_poi * poi_pd
+        p_away = w_dc * dc_pa + w_mkt * mkt_pa + w_poi * poi_pa
+    else:
+        # Re-normalisieren auf DC+Poisson
+        total_w = w_dc + w_poi
+        p_home  = (w_dc * dc_ph + w_poi * poi_ph) / total_w
+        p_draw  = (w_dc * dc_pd + w_poi * poi_pd) / total_w
+        p_away  = (w_dc * dc_pa + w_poi * poi_pa) / total_w
+
+    # Normalisieren auf Summe 1.0
+    total = p_home + p_draw + p_away
+    if total > 0:
+        p_home /= total
+        p_draw /= total
+        p_away /= total
+
+    # ── Winner + Confidence ───────────────────────────────────────
+    if p_home >= p_draw and p_home >= p_away:
+        winner, lead_p = "home", p_home
+    elif p_away >= p_home and p_away >= p_draw:
+        winner, lead_p = "away", p_away
+    else:
+        winner, lead_p = "draw", p_draw
+
+    # Konfidenz: proportional zur Stärke des Signals
+    # Gate A (vollständiger Markt) = höchste Vertrauensbasis
+    conf_boost = 5 if has_full_odds else (2 if has_home_odds else 0)
+    conf       = min(95, int(50 + abs(lead_p - (1/3)) * 90) + conf_boost)
+
+    # Score-Tipp: aus DC übernehmen (bester Score-Tipp laut Backtest)
+    main_tip = dc_result.get("predicted_score", "1:1")
+
+    return {"predicted_winner": winner,
+            "predicted_score":  main_tip,
+            "confidence_score": conf,
+            "prob_home": round(p_home, 4),
+            "prob_draw": round(p_draw, 4),
+            "prob_away": round(p_away, 4)}
 
 
 @register_model
@@ -371,6 +483,9 @@ def dc(m: dict) -> dict:
     main_tip = top[0][0] if top else f"{round(lh)}:{round(la)}"
     conf   = int(min(85, top[0][1] * 100 * 2.5)) if top else 50
     _ph, _pd, _pa = probs_from_score_grid(grid)
+    # ── Kalibrierung anwenden (P4) ────────────────────────────────
+    if DC_CALIBRATION is not None and _CALIBRATION_AVAILABLE:
+        _ph, _pd, _pa = calibrate_dc_probs(_ph, _pd, _pa, DC_CALIBRATION)
     return {"predicted_winner": winner, "predicted_score": main_tip,
             "confidence_score": conf,
             "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
