@@ -298,7 +298,24 @@ def winner_from_grid(grid: dict) -> str:
 
 MODELS: dict = {}
 
+# ── Modell-Aktivierung ───────────────────────────────────────────
+# DC ist das beste Einzelmodell (tend% 48.1, avg_pts 1.16, brier 0.2065).
+# Das heuristische Ensemble (tend% 36.4, avg_pts 0.96) verschlechtert DC.
+# Bis ein kalibriertes Meta-Ensemble vorliegt:
+#   ENSEMBLE_ENABLED = False  → ensemble läuft nicht im Backtest
+#   PRIMARY_MODEL     = "dc"   → v_history + Reports nutzen DC
+ENSEMBLE_ENABLED: bool = False
+PRIMARY_MODEL:    str  = "dc"
+
 def register_model(fn):
+    """Decorator: registriert ein Modell in MODELS.
+    Respektiert ENSEMBLE_ENABLED — wenn False, wird das Ensemble
+    nicht registriert und läuft nicht im Backtest.
+    """
+    if fn.__name__ == "ensemble" and not ENSEMBLE_ENABLED:
+        log.info("[config] ensemble deaktiviert (ENSEMBLE_ENABLED=False) "
+                 "— DC ist aktives Primary-Modell")
+        return fn   # Funktion bleibt verfügbar, aber nicht in MODELS
     MODELS[fn.__name__] = fn
     return fn
 
@@ -376,19 +393,108 @@ def elo(m: dict) -> dict:
 
 @register_model
 def market(m: dict) -> dict:
-    # Column in Supabase is market_home_win_odds (set by fetch_matches.py)
-    quote  = m.get("market_home_win_odds") or m.get("market_signal_home") or 2.0
-    implied = min(0.92, max(0.08, (1 / quote) * 0.9))
-    winner  = "home" if implied > 0.55 else ("away" if implied < 0.40 else "draw")
-    conf    = int(40 + implied * 45)
-    diff    = strength_diff(m)
-    hg      = 0.9 + diff * 1.2
-    ag      = 0.8 - diff * 0.6
+    """
+    Market-Modell: nutzt Wettquoten als Wahrscheinlichkeitssignal.
+
+    ARCHITEKTUR-ENTSCHEIDUNG:
+      Nur echte Quoten werden genutzt — kein Fallback auf fake Defaults.
+      Wenn keine Quote vorhanden: Modell liefert Fallback auf DC-ähnliche
+      Stärke+Form-Basis, aber mit explizitem market_available=False Flag.
+      Begründung: quote=2.0 als Default erzeugte ~97% fake "Remis"-Signale.
+
+    VERFÜGBARE DATEN (football-data.org Free Tier):
+      - market_home_win_odds: oft vorhanden (aber nicht immer)
+      - market_draw_odds:     NICHT im Schema — muss noch ergänzt werden
+      - market_away_odds:     NICHT im Schema — muss noch ergänzt werden
+
+    ÜBERRUND-ENTFERNUNG (wenn nur home_odds verfügbar):
+      Wir schätzen draw_p und away_p via historische Liga-Basisraten:
+        draw_base  = 0.26  (Europäischer Top-Liga-Durchschnitt)
+        away_base  = 0.27
+        home_base  = 0.47 → normiert auf Summe 1.0
+      home_implied skaliert draw/away proportional.
+    """
+    raw_home_odds = m.get("market_home_win_odds") or m.get("market_signal_home")
+
+    diff = strength_diff(m)
+    hg   = 0.9 + diff * 1.2
+    ag   = 0.8 - diff * 0.6
     main_tip = f"{max(0, round(hg))}:{max(0, round(ag))}"
-    _ph, _pd, _pa = probs_from_home_probability(implied)
-    return {"predicted_winner": winner, "predicted_score": main_tip,
-            "confidence_score": min(90, conf),
-            "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa}
+
+    if not raw_home_odds or raw_home_odds <= 1.0:
+        # Keine validen Quoten → Modell fällt auf Stärke-Diff zurück
+        # (identisch mit DC-Fallback, aber transparent als "kein Marktsignal" markiert)
+        home_p = min(0.88, max(0.12, 0.47 + diff * 0.4))
+        _ph, _pd, _pa = probs_from_home_probability(home_p)
+        return {"predicted_winner": "home" if home_p > 0.55 else ("away" if home_p < 0.40 else "draw"),
+                "predicted_score":  main_tip,
+                "confidence_score": 20,   # niedrig: kein Marktsignal
+                "prob_home": _ph, "prob_draw": _pd, "prob_away": _pa,
+                "market_available": False}
+
+    # ── Echte Quote vorhanden ────────────────────────────────────────────
+    # Schritt 1: Rohe implizite Wahrscheinlichkeit (inkl. Overround ~5-8%)
+    raw_p_home = 1.0 / raw_home_odds
+
+    # Schritt 2: Overround entfernen
+    # Ohne Draw/Away-Quoten schätzen wir den Overround als ~7% (typisch)
+    # und skalieren die Home-P entsprechend
+    draw_odds  = m.get("market_draw_odds")      # None wenn nicht im Schema
+    away_odds  = m.get("market_away_odds")       # None wenn nicht im Schema
+
+    if draw_odds and away_odds and draw_odds > 1.0 and away_odds > 1.0:
+        # ── Vollständige 3-Wege-Quoten: saubere Overround-Entfernung ────
+        raw_p_draw = 1.0 / draw_odds
+        raw_p_away = 1.0 / away_odds
+        overround  = raw_p_home + raw_p_draw + raw_p_away   # > 1.0
+        p_home = raw_p_home / overround
+        p_draw = raw_p_draw / overround
+        p_away = raw_p_away / overround
+    else:
+        # ── Nur Home-Quote: Schätzung via historische Basisraten ─────────
+        # Entferne approximierten Overround von 7%
+        p_home = min(0.90, raw_p_home / 1.07)
+        rest   = 1.0 - p_home
+        # Historisches Verhältnis Draw:Away ≈ 49:51 in Top-Ligen
+        p_draw = rest * 0.490
+        p_away = rest * 0.510
+
+    # Normalisieren auf Summe 1.0 (Rundungsfehler absichern)
+    total  = p_home + p_draw + p_away
+    p_home /= total
+    p_draw /= total
+    p_away /= total
+
+    # Wahrscheinlichkeiten auf [0.04, 0.92] clampen
+    p_home = min(0.92, max(0.04, p_home))
+    p_draw = min(0.92, max(0.04, p_draw))
+    p_away = min(0.92, max(0.04, p_away))
+    # Nochmals normalisieren nach Clamping
+    total  = p_home + p_draw + p_away
+    p_home /= total
+    p_draw /= total
+    p_away /= total
+
+    # Sieger + Konfidenz
+    if p_home >= p_draw and p_home >= p_away:
+        winner, lead_p = "home", p_home
+    elif p_away >= p_home and p_away >= p_draw:
+        winner, lead_p = "away", p_away
+    else:
+        winner, lead_p = "draw", p_draw
+
+    # Konfidenz: stark wenn Markt klare Meinung hat + vollständige Quoten
+    has_full_odds = bool(draw_odds and away_odds)
+    base_conf     = int(min(90, 40 + lead_p * 60))
+    conf          = base_conf if has_full_odds else max(35, base_conf - 15)
+
+    return {"predicted_winner": winner,
+            "predicted_score":  main_tip,
+            "confidence_score": conf,
+            "prob_home": round(p_home, 4),
+            "prob_draw": round(p_draw, 4),
+            "prob_away": round(p_away, 4),
+            "market_available": True}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -453,7 +559,8 @@ def fetch_supabase_enrichment(competition_code: str | None = None) -> dict:
         # Strength/form are computed by historical_features.py, not from Supabase.
         ("select", "external_id,competition_code,league_abbr,flag,"
                    "home_team,away_team,"
-                   "market_home_win_odds"),
+                   "market_home_win_odds,"
+                   "market_draw_odds,market_away_odds"),
         ("limit",  "5000"),
     ]
     if competition_code:
@@ -652,6 +759,8 @@ def fetch_finished_from_api(
                 "form_home":            [],
                 "form_away":            [],
                 "market_home_win_odds": enrich.get("market_home_win_odds"),
+                "market_draw_odds":      enrich.get("market_draw_odds"),
+                "market_away_odds":      enrich.get("market_away_odds"),
                 "win_probability":      50,
                 "feature_src":          "pending",
 
@@ -802,9 +911,12 @@ def run_backtest(
     dry_run: bool = False,
 ) -> None:
     log.info("── Backtest start ──────────────────────────────────")
-    log.info("  competition : %s", competition or "all active")
-    log.info("  season      : %s", season or "latest")
-    log.info("  dry_run     : %s", dry_run)
+    log.info("  competition      : %s", competition or "all active")
+    log.info("  season           : %s", season or "latest")
+    log.info("  dry_run          : %s", dry_run)
+    log.info("  primary_model    : %s", PRIMARY_MODEL)
+    log.info("  ensemble_enabled : %s", ENSEMBLE_ENABLED)
+    log.info("  active_models    : %s", list(MODELS.keys()))
 
     _sys_version = get_system_version()
     _run_id      = start_pipeline_run(
