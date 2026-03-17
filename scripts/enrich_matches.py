@@ -391,11 +391,28 @@ def run(days_ahead: int, dry_run: bool) -> None:
     team_strength: dict[int, int] = {}
 
     for source_code, team_ids in teams_by_source.items():
-        if source_code not in STANDINGS_CAPABLE:
-            log.info("  %s — no standings endpoint, strength will be null.", source_code)
-            time.sleep(REQUEST_DELAY_SECONDS)
+     if source_code not in STANDINGS_CAPABLE:
+     log.info("  %s — no standings, using form fallback.", source_code)
+
+    # 🔥 FIX: fallback strength aus Form
+    for team_id in team_ids:
+        form = team_form.get(team_id, [])
+
+        if not form:
+            team_strength[team_id] = 50
             continue
 
+        pts = sum({"W":3,"D":1,"L":0}.get(x,0) for x in form)
+        max_pts = len(form) * 3
+
+        score = int((pts / max_pts) * 100)
+
+        team_strength[team_id] = max(25, min(85, score))
+
+    time.sleep(REQUEST_DELAY_SECONDS)
+    continue
+
+      
         log.info("  GET standings: %s", source_code)
         table = fd.get_standings(source_code)
         if not table:
