@@ -181,6 +181,85 @@ class SupabaseClient:
         log.info("  → %d match(es) found.  (url: %s)", len(rows), response.url)
         return rows
 
+    def fetch_dirty_matches(self, date_from: str, date_to: str) -> list[dict[str, Any]]:
+        """
+        Return only matches that are missing a prediction or whose prediction is stale.
+        Reads IDs from v_dirty_predictions and then loads the full rows from matches.
+        """
+        dirty_url = f"{self.base_url}/rest/v1/v_dirty_predictions"
+
+        def _clean_ts(ts: str) -> str:
+            try:
+                dt = datetime.fromisoformat(ts)
+                return dt.replace(microsecond=0).isoformat()
+            except ValueError:
+                return ts
+
+        ts_from = _clean_ts(date_from)
+        ts_to   = _clean_ts(date_to)
+
+        params = [
+            ("kickoff_at", f"gte.{ts_from}"),
+            ("kickoff_at", f"lt.{ts_to}"),
+            ("order", "kickoff_at.asc"),
+            ("select", "match_id"),
+        ]
+
+        log.info("  Fetching dirty matches: %s → %s", ts_from, ts_to)
+
+        response = requests.get(
+            dirty_url,
+            params=params,
+            headers={**self._auth_headers, "Range": "0-999"},
+            timeout=20,
+        )
+
+        if not response.ok:
+            log.error(
+                "  Supabase dirty fetch failed: %d %s\n  URL : %s\n  Body: %s",
+                response.status_code,
+                response.reason,
+                response.url,
+                response.text[:500],
+            )
+            response.raise_for_status()
+
+        dirty_rows = response.json()
+        match_ids = [row["match_id"] for row in dirty_rows if row.get("match_id")]
+
+        if not match_ids:
+            log.info("  → 0 dirty match(es) found.")
+            return []
+
+        matches_url = f"{self.base_url}/rest/v1/matches"
+        id_list = ",".join(match_ids)
+        params = {
+            "id": f"in.({id_list})",
+            "order": "kickoff_at.asc",
+            "select": "*",
+        }
+
+        response = requests.get(
+            matches_url,
+            params=params,
+            headers={**self._auth_headers, "Range": "0-999"},
+            timeout=20,
+        )
+
+        if not response.ok:
+            log.error(
+                "  Supabase match fetch for dirty IDs failed: %d %s\n  URL : %s\n  Body: %s",
+                response.status_code,
+                response.reason,
+                response.url,
+                response.text[:500],
+            )
+            response.raise_for_status()
+
+        rows = response.json()
+        log.info("  → %d dirty match(es) loaded.", len(rows))
+        return rows
+
     # ── WRITE ─────────────────────────────────────────────────
 
     def upsert_predictions(self, rows: list[dict[str, Any]]) -> None:
@@ -657,6 +736,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Compute predictions but do NOT write to Supabase.",
     )
+    parser.add_argument(
+        "--dirty-only",
+        action="store_true",
+        help="Only compute matches with missing or stale predictions from v_dirty_predictions.",
+    )
     return parser
 
 
@@ -683,7 +767,7 @@ def load_env() -> tuple[str, str]:
 # PIPELINE
 # ─────────────────────────────────────────────────────────────
 
-def run(days_ahead: int, dry_run: bool) -> None:
+def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
     now       = datetime.now(timezone.utc)
     date_from = now.isoformat()
     date_to   = (now + timedelta(days=days_ahead)).isoformat()
@@ -694,6 +778,7 @@ def run(days_ahead: int, dry_run: bool) -> None:
     log.info("From     : %s", date_from)
     log.info("To       : %s", date_to)
     log.info("Dry run  : %s", dry_run)
+    log.info("Dirty only: %s", dirty_only)
     log.info("Model    : v%s", MODEL_VERSION)
     log.info("═══════════════════════════════════════════════")
 
@@ -701,7 +786,7 @@ def run(days_ahead: int, dry_run: bool) -> None:
     _run_id      = start_pipeline_run(
         "compute_predictions",
         system_version=_sys_version,
-        metadata={"days_ahead": days_ahead, "dry_run": dry_run},
+        metadata={"days_ahead": days_ahead, "dry_run": dry_run, "dirty_only": dirty_only},
     )
     register_system_release()
     log.info("Version    : %s", _sys_version)
@@ -713,14 +798,17 @@ def run(days_ahead: int, dry_run: bool) -> None:
 
         # ── Fetch matches
         try:
-            matches = sb.fetch_upcoming_matches(date_from, date_to)
+            if dirty_only:
+                matches = sb.fetch_dirty_matches(date_from, date_to)
+            else:
+                matches = sb.fetch_upcoming_matches(date_from, date_to)
         except requests.HTTPError as exc:
             raise RuntimeError(f"Failed to fetch matches from Supabase: {exc}") from exc
         except requests.RequestException as exc:
             raise RuntimeError(f"Network error fetching matches: {exc}") from exc
 
         if not matches:
-            log.info("No upcoming matches found in window. Nothing to compute.")
+            log.info("No matches found for selected mode/window. Nothing to compute.")
             log.info("Status: SUCCESS (no-op)")
             finish_pipeline_run(
                 _run_id,
@@ -779,9 +867,11 @@ def run(days_ahead: int, dry_run: bool) -> None:
 
         log.info("─── Computed %d / %d prediction(s).", len(predictions), len(matches))
 
+        computed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         for p in predictions:
             p["system_version"]  = _sys_version
             p["pipeline_run_id"] = _run_id
+            p["computed_at"]     = computed_at
 
         if dry_run:
             log.info("[DRY RUN] Would upsert %d row(s).", len(predictions))
@@ -798,6 +888,7 @@ def run(days_ahead: int, dry_run: bool) -> None:
         log.info("═══════════════════════════════════════════════")
         log.info("SUMMARY")
         log.info("  Matches fetched    : %d", len(matches))
+        log.info("  Dirty-only mode    : %s", dirty_only)
         log.info("  Skipped (past)     : %d", skipped_past)
         log.info("  Predictions built  : %d", len(predictions))
         log.info("  Strong tips (≥%d%%): %d", STRONG_TIP_THRESHOLD, strong_tips)
@@ -823,13 +914,14 @@ def run(days_ahead: int, dry_run: bool) -> None:
                 "errors": len(compute_errors),
                 "skipped_past": skipped_past,
                 "dry_run": dry_run,
+                "dirty_only": dirty_only,
             },
         )
     except Exception as exc:
         finish_pipeline_run(
             _run_id,
             status="failed",
-            metadata={"error": str(exc), "days_ahead": days_ahead, "dry_run": dry_run},
+            metadata={"error": str(exc), "days_ahead": days_ahead, "dry_run": dry_run, "dirty_only": dirty_only},
         )
         log.error("Pipeline failed: %s", exc)
         sys.exit(1)
@@ -837,7 +929,7 @@ def run(days_ahead: int, dry_run: bool) -> None:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    run(days_ahead=args.days_ahead, dry_run=args.dry_run)
+    run(days_ahead=args.days_ahead, dry_run=args.dry_run, dirty_only=args.dirty_only)
 
 
 if __name__ == "__main__":
