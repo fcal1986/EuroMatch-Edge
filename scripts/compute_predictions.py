@@ -439,7 +439,7 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         form_score = None
 
     # Fixed home advantage (always known)
-    home_adv_score: float = 0.58    # ~58% baseline win rate for home team
+    home_adv_score: float = 0.52    # ~58% baseline win rate for home team
 
     # Injuries: symmetric — away injuries boost home score, home injuries lower it.
     # Each side contributes independently; neutral (0.50) when both unknown.
@@ -501,9 +501,17 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         "market":     market_score,
     }
 
-    home_score, n_known = weighted_average(factors, WEIGHTS)
-    home_score = clamp(home_score, 0.05, 0.93)
+home_score, n_known = weighted_average(factors, WEIGHTS)
 
+# 🔥 FIX: Symmetrie gegen Heim-Bias
+if home_str is not None and away_str is not None:
+  diff = away_str - home_str
+    if diff > 0:
+    home_score -= diff * 0.18
+
+home_score = clamp(home_score, 0.02, 0.95)
+  
+    
     # ── 4. Derive draw and away probabilities ─────────────────
     # home_score IS the win probability directly.
     # Draw probability decays exponentially as the match becomes more one-sided.
