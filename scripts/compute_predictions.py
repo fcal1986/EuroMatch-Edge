@@ -71,9 +71,9 @@ STRONG_TIP_THRESHOLD = 70
 
 # Model factor weights — must sum to 1.0
 WEIGHTS = {
-    "strength":   0.32,
+    "strength":   0.36,
     "form":       0.22,
-    "home_adv":   0.12,
+    "home_adv":   0.08,
     "injuries":   0.12,
     "motivation": 0.10,
     "load":       0.08,
@@ -508,7 +508,7 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
     if home_str is not None and away_str is not None:
         diff = away_str - home_str
         if diff > 0:
-            home_score -= diff * 0.18
+            home_score -= diff * 0.25
 
     home_score = clamp(home_score, 0.02, 0.95)
 
