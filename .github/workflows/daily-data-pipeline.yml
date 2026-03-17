@@ -1,7 +1,6 @@
 name: Daily Data Pipeline
 
 "on":
-  # ── Manual trigger (for testing and ad-hoc runs)
   workflow_dispatch:
     inputs:
       date_from:
@@ -18,7 +17,6 @@ name: Daily Data Pipeline
         type: boolean
         default: false
 
-  # ── Scheduled trigger: daily at 06:00 UTC
   schedule:
     - cron: "0 6-23 * * *"
 
@@ -29,11 +27,9 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # ── 1. Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Python setup
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -41,84 +37,82 @@ jobs:
           cache: "pip"
           cache-dependency-path: "scripts/requirements.txt"
 
-      # ── 3. Install dependencies
       - name: Install dependencies
         run: pip install -r scripts/requirements.txt
 
-      # ── 4. Resolve date range
-      # For scheduled runs: date_from and date_to are empty → scripts use their own defaults.
-      # For manual runs: pass through whatever the user entered (or leave empty for defaults).
       - name: Resolve run parameters
         id: params
+        shell: bash
         run: |
           DATE_FROM="${{ github.event.inputs.date_from }}"
           DATE_TO="${{ github.event.inputs.date_to }}"
           DRY_RUN="${{ github.event.inputs.dry_run }}"
 
-          # Build optional CLI flags
           FETCH_FLAGS=""
-          COMPUTE_FLAGS=""
+          ENRICH_FLAGS=""
+          COMPUTE_FLAGS="--dirty-only"
 
           if [ -n "$DATE_FROM" ]; then
             FETCH_FLAGS="$FETCH_FLAGS --date-from $DATE_FROM"
+            ENRICH_FLAGS="$ENRICH_FLAGS --date-from $DATE_FROM"
           fi
           if [ -n "$DATE_TO" ]; then
             FETCH_FLAGS="$FETCH_FLAGS --date-to $DATE_TO"
+            ENRICH_FLAGS="$ENRICH_FLAGS --date-to $DATE_TO"
           fi
           if [ "$DRY_RUN" = "true" ]; then
             FETCH_FLAGS="$FETCH_FLAGS --dry-run"
+            ENRICH_FLAGS="$ENRICH_FLAGS --dry-run"
             COMPUTE_FLAGS="$COMPUTE_FLAGS --dry-run"
           fi
 
-          echo "fetch_flags=$FETCH_FLAGS"   >> "$GITHUB_OUTPUT"
+          echo "fetch_flags=$FETCH_FLAGS" >> "$GITHUB_OUTPUT"
+          echo "enrich_flags=$ENRICH_FLAGS" >> "$GITHUB_OUTPUT"
           echo "compute_flags=$COMPUTE_FLAGS" >> "$GITHUB_OUTPUT"
 
           echo "── Run parameters ──────────────────────"
-          echo "  date_from  : ${DATE_FROM:-<default>}"
-          echo "  date_to    : ${DATE_TO:-<default>}"
-          echo "  dry_run    : ${DRY_RUN:-false}"
-          echo "  fetch_flags: $FETCH_FLAGS"
-          echo "  compute_flags: $COMPUTE_FLAGS"
+          echo "  date_from      : ${DATE_FROM:-<default>}"
+          echo "  date_to        : ${DATE_TO:-<default>}"
+          echo "  dry_run        : ${DRY_RUN:-false}"
+          echo "  fetch_flags    : $FETCH_FLAGS"
+          echo "  enrich_flags   : $ENRICH_FLAGS"
+          echo "  compute_flags  : $COMPUTE_FLAGS"
 
-      # ── 5. Fetch matches from football-data.org → Supabase
       - name: Fetch matches
         working-directory: scripts
         env:
-          FOOTBALL_DATA_API_KEY:     ${{ secrets.FOOTBALL_DATA_API_KEY }}
-          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           echo "── fetch_matches.py ${{ steps.params.outputs.fetch_flags }}"
           python fetch_matches.py ${{ steps.params.outputs.fetch_flags }}
 
-      # ── 6. Enrich matches with strength + form data → Supabase
       - name: Enrich matches
         working-directory: scripts
         env:
-          FOOTBALL_DATA_API_KEY:     ${{ secrets.FOOTBALL_DATA_API_KEY }}
-          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          echo "── enrich_matches.py ${{ steps.params.outputs.compute_flags }}"
-          python enrich_matches.py ${{ steps.params.outputs.compute_flags }}
+          echo "── enrich_matches.py ${{ steps.params.outputs.enrich_flags }}"
+          python enrich_matches.py ${{ steps.params.outputs.enrich_flags }}
 
-      # ── 7. Compute predictions → Supabase
       - name: Compute predictions
         working-directory: scripts
         env:
-          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          APP_VERSION:               ${{ vars.APP_VERSION }}
-          GITHUB_SHA:                ${{ github.sha }}
-          GITHUB_REF_NAME:           ${{ github.ref_name }}
-          MODEL_VERSION:             "1.0"
-          CALIBRATION_VERSION:       "1.0"
-          WEIGHTS_VERSION:           "1.0"
+          APP_VERSION: ${{ vars.APP_VERSION }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          MODEL_VERSION: "1.0"
+          CALIBRATION_VERSION: "1.0"
+          WEIGHTS_VERSION: "1.0"
         run: |
           echo "── compute_predictions.py ${{ steps.params.outputs.compute_flags }}"
           python compute_predictions.py ${{ steps.params.outputs.compute_flags }}
 
-      # ── 8. Summary (always runs, even on failure)
       - name: Pipeline summary
         if: always()
         run: |
