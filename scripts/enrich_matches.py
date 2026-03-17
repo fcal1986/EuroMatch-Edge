@@ -391,28 +391,33 @@ def run(days_ahead: int, dry_run: bool) -> None:
     team_strength: dict[int, int] = {}
 
     for source_code, team_ids in teams_by_source.items():
-     if source_code not in STANDINGS_CAPABLE:
-     log.info("  %s — no standings, using form fallback.", source_code)
+        if source_code not in STANDINGS_CAPABLE:
+            log.info("  %s — no standings, using recent-matches fallback for strength.", source_code)
 
-    # 🔥 FIX: fallback strength aus Form
-    for team_id in team_ids:
-        form = team_form.get(team_id, [])
+            for team_id in team_ids:
+                recent = fd.get_team_recent_matches(team_id, limit=5)
+                form = compute_form(recent, team_id)
 
-        if not form:
-            team_strength[team_id] = 50
+                if not form:
+                    team_strength[team_id] = 50
+                    log.info("    fallback strength team %s -> 50 (no recent form)", team_id)
+                    time.sleep(REQUEST_DELAY_SECONDS)
+                    continue
+
+                pts = sum({"W": 3, "D": 1, "L": 0}.get(x, 0) for x in form)
+                max_pts = len(form) * 3
+                score = int((pts / max_pts) * 100)
+
+                team_strength[team_id] = max(25, min(85, score))
+                log.info(
+                    "    fallback strength team %s -> %s from form %s",
+                    team_id, team_strength[team_id], form
+                )
+
+                time.sleep(REQUEST_DELAY_SECONDS)
+
             continue
 
-        pts = sum({"W":3,"D":1,"L":0}.get(x,0) for x in form)
-        max_pts = len(form) * 3
-
-        score = int((pts / max_pts) * 100)
-
-        team_strength[team_id] = max(25, min(85, score))
-
-    time.sleep(REQUEST_DELAY_SECONDS)
-    continue
-
-      
         log.info("  GET standings: %s", source_code)
         table = fd.get_standings(source_code)
         if not table:
