@@ -63,7 +63,7 @@ const DataLayer = {
     
     if (!Array.isArray(raw)) throw new Error('Supabase returned unexpected format');
     
-    const mapped = Wrapper.fromRows(raw);
+    const mapped = Mapper.fromRows(raw);
     if (window.Debug?.success) {
       Debug.success('Mapping abgeschlossen',{count: mapped.length, sample: mapped[0]});
     }
