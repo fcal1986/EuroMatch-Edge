@@ -22,5 +22,6 @@ jobs:
       - name: Dry run compute predictions
         run: python scripts/compute_predictions.py --dry-run --days-ahead 2
         env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
