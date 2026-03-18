@@ -2,9 +2,9 @@
 
 /* ── Cache ───────────────────────────────────────────────────── */
 const Cache = (() => {
-  const LS_KEY       = 'eme_cache_v1';
+  const LS_KEY       = 'eme_cache_v2';
   const SCHEMA_VER   = 1;
-  let _mem           = null; // runtime mirror for fast reads
+  let _mem           = null;
 
   function _load() {
     if (_mem) return _mem;
@@ -29,12 +29,10 @@ const Cache = (() => {
   }
 
   return {
-    /** Persist a fresh dataset. source = 'supabase' | 'mock' etc. */
     write(rows, source = 'unknown') {
       _save({ rows, source, ts: Date.now(), schemaVersion: SCHEMA_VER });
     },
 
-    /** Returns rows only if within TTL, otherwise null. */
     read() {
       const entry = _load();
       if (!entry) return null;
@@ -42,20 +40,17 @@ const Cache = (() => {
       return entry.rows;
     },
 
-    /** Always returns the last known rows, regardless of TTL. */
     readStale() {
       const entry = _load();
       return entry ? entry.rows : null;
     },
 
-    /** Ms remaining in current TTL (0 if expired/empty). */
     ttlRemaining() {
       const entry = _load();
       if (!entry) return 0;
       return Math.max(0, CFG.CACHE_TTL_MS - (Date.now() - entry.ts));
     },
 
-    /** Source of the cached data ('supabase', 'mock', …). */
     lastSource() {
       const entry = _load();
       return entry ? entry.source : null;
@@ -67,4 +62,3 @@ const Cache = (() => {
     },
   };
 })();
-
