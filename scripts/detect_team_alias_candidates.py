@@ -1,9 +1,8 @@
 import os
-import json
 import logging
 import re
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime
 from hashlib import sha256
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,6 +15,8 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 ODDS_API_KEY = os.environ["ODDS_API_KEY"]
 
 LOOKAHEAD_DAYS = int(os.getenv("ODDS_LOOKAHEAD_DAYS", "14"))
+ODDS_REGIONS = os.getenv("ODDS_REGIONS", "eu,uk")
+ODDS_MARKETS = os.getenv("ODDS_MARKETS", "h2h")
 REQUEST_TIMEOUT = int(os.getenv("ODDS_REQUEST_TIMEOUT", "30"))
 
 SPORTS_URL = "https://api.the-odds-api.com/v4/sports"
@@ -26,6 +27,38 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("detect_team_alias_candidates")
+
+
+# -----------------------------------------------------------------------------
+# Normalisierung / Aliase
+# -----------------------------------------------------------------------------
+
+TEAM_ALIASES: Dict[str, List[str]] = {
+    "bayern munchen": ["bayern", "bayern munich"],
+    "atalanta": ["atalanta bc", "atalanta bergamasca calcio"],
+    "sporting": [
+        "sporting clube de portugal",
+        "sporting cp",
+        "sporting lisbon",
+        "sporting portugal",
+    ],
+    "bodo glimt": ["fk bodo glimt", "bodo glimt", "bodo/glimt"],
+    "paris saint germain": ["psg", "paris saint germain fc"],
+    "real madrid": ["real madrid cf"],
+    "barcelona": ["fc barcelona"],
+    "atletico madrid": ["club atletico de madrid", "atletico de madrid", "atletico madrid"],
+    "watford": ["watford fc"],
+    "wrexham": ["wrexham afc"],
+    "southampton": ["southampton fc"],
+    "norwich city": ["norwich city fc"],
+    "manchester city": ["manchester city fc"],
+    "chelsea": ["chelsea fc"],
+    "arsenal": ["arsenal fc"],
+    "newcastle united": ["newcastle united fc"],
+    "tottenham hotspur": ["tottenham hotspur fc", "spurs"],
+    "liverpool": ["liverpool fc"],
+    "galatasaray": ["galatasaray sk"],
+}
 
 
 def normalize_text(value: Optional[str]) -> str:
@@ -52,6 +85,7 @@ def normalize_team_name(name: Optional[str]) -> str:
         return ""
 
     value = name.lower().strip()
+
     value = (
         value.replace("ä", "ae")
         .replace("ö", "oe")
@@ -61,12 +95,15 @@ def normalize_team_name(name: Optional[str]) -> str:
 
     value = unicodedata.normalize("NFKD", value)
     value = "".join(c for c in value if not unicodedata.combining(c))
-    value = value.replace("/", " ").replace("-", " ")
+
+    value = value.replace("/", " ")
+    value = value.replace("-", " ")
     value = re.sub(r"[^a-z0-9 ]+", " ", value)
 
     stopwords = {
         "fc", "sc", "sv", "ev", "afc", "bc", "cf",
-        "sk", "fk", "club", "clube"
+        "sk", "fk", "club", "clube",
+        "de", "da", "do", "del"
     }
     parts = [p for p in value.split() if p not in stopwords]
     value = " ".join(parts)
@@ -91,29 +128,6 @@ def normalize_team_name(name: Optional[str]) -> str:
     return value
 
 
-TEAM_ALIASES: Dict[str, List[str]] = {
-    "bayern munchen": ["bayern", "bayern munich"],
-    "atalanta": ["atalanta bc"],
-    "sporting": ["sporting clube de portugal", "sporting cp", "sporting lisbon", "sporting portugal"],
-    "bodo glimt": ["fk bodo glimt", "bodo glimt"],
-    "paris saint germain": ["psg", "paris saint germain fc"],
-    "real madrid": ["real madrid cf"],
-    "barcelona": ["fc barcelona"],
-    "atletico madrid": ["club atletico de madrid", "atletico de madrid"],
-    "watford": ["watford fc"],
-    "wrexham": ["wrexham afc"],
-    "southampton": ["southampton fc"],
-    "norwich city": ["norwich city fc"],
-    "manchester city": ["manchester city fc"],
-    "chelsea": ["chelsea fc"],
-    "arsenal": ["arsenal fc"],
-    "newcastle united": ["newcastle united fc"],
-    "tottenham hotspur": ["tottenham hotspur fc", "spurs"],
-    "liverpool": ["liverpool fc"],
-    "galatasaray": ["galatasaray sk"],
-}
-
-
 def team_name_candidates(name: Optional[str]) -> List[str]:
     norm = normalize_team_name(name)
     candidates = {norm}
@@ -130,6 +144,10 @@ def team_name_candidates(name: Optional[str]) -> List[str]:
     return [c for c in candidates if c]
 
 
+# -----------------------------------------------------------------------------
+# String-/Matching-Helfer
+# -----------------------------------------------------------------------------
+
 def parse_iso_ts(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -139,18 +157,68 @@ def parse_iso_ts(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def token_set(value: str) -> set[str]:
+    return set(value.split()) if value else set()
+
+
 def similarity_score(a: str, b: str) -> float:
+    """
+    Jaccard-ähnliches Token-Overlap.
+    """
     if not a or not b:
         return 0.0
 
-    set_a = set(a.split())
-    set_b = set(b.split())
+    set_a = token_set(a)
+    set_b = token_set(b)
     if not set_a or not set_b:
         return 0.0
 
     overlap = len(set_a & set_b)
     union = len(set_a | set_b)
     return overlap / union if union else 0.0
+
+
+def is_substringish(a: str, b: str) -> bool:
+    """
+    Prüft, ob ein Name im anderen enthalten ist.
+    """
+    if not a or not b:
+        return False
+    return a in b or b in a
+
+
+def is_trivial_name_difference(a: str, b: str) -> bool:
+    """
+    Filtert kosmetische Unterschiede raus:
+    - hoher Score
+    - oder gleiche Tokenmenge
+    - oder Teilstring-Beziehung
+    """
+    if not a or not b:
+        return False
+
+    if a == b:
+        return True
+
+    score = similarity_score(a, b)
+    if score >= 0.95:
+        return True
+
+    if token_set(a) == token_set(b):
+        return True
+
+    if is_substringish(a, b) and score >= 0.75:
+        return True
+
+    return False
+
+
+def kickoff_close(db_kickoff: datetime, api_commence: Optional[str], max_minutes_diff: int = 180) -> bool:
+    api_ts = parse_iso_ts(api_commence)
+    if not api_ts:
+        return True
+    diff_minutes = abs((db_kickoff - api_ts).total_seconds()) / 60.0
+    return diff_minutes <= max_minutes_diff
 
 
 def build_dedup_key(
@@ -169,6 +237,10 @@ def build_dedup_key(
     ])
     return sha256(raw.encode("utf-8")).hexdigest()
 
+
+# -----------------------------------------------------------------------------
+# Odds API Discovery
+# -----------------------------------------------------------------------------
 
 def fetch_available_sports() -> List[Dict[str, Any]]:
     response = requests.get(
@@ -269,6 +341,10 @@ def resolve_sport_key(
     return None
 
 
+# -----------------------------------------------------------------------------
+# DB
+# -----------------------------------------------------------------------------
+
 def get_upcoming_matches(conn, sport_lookup: Dict[str, str]) -> List[Dict[str, Any]]:
     with conn.cursor() as cur:
         cur.execute(
@@ -316,13 +392,17 @@ def get_upcoming_matches(conn, sport_lookup: Dict[str, str]) -> List[Dict[str, A
     return matches
 
 
+# -----------------------------------------------------------------------------
+# Odds-Daten abrufen
+# -----------------------------------------------------------------------------
+
 def fetch_odds_for_sport(sport_key: str) -> List[Dict[str, Any]]:
     response = requests.get(
         ODDS_URL_TEMPLATE.format(sport_key=sport_key),
         params={
             "apiKey": ODDS_API_KEY,
-            "regions": "eu,uk",
-            "markets": "h2h",
+            "regions": ODDS_REGIONS,
+            "markets": ODDS_MARKETS,
             "oddsFormat": "decimal",
         },
         timeout=REQUEST_TIMEOUT,
@@ -333,13 +413,9 @@ def fetch_odds_for_sport(sport_key: str) -> List[Dict[str, Any]]:
     return events
 
 
-def kickoff_close(db_kickoff: datetime, api_commence: Optional[str], max_minutes_diff: int = 180) -> bool:
-    api_ts = parse_iso_ts(api_commence)
-    if not api_ts:
-        return True
-    diff_minutes = abs((db_kickoff - api_ts).total_seconds()) / 60.0
-    return diff_minutes <= max_minutes_diff
-
+# -----------------------------------------------------------------------------
+# Kandidatensuche
+# -----------------------------------------------------------------------------
 
 def find_best_candidate(match: Dict[str, Any], events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     db_home_norm = normalize_team_name(match["home_team"])
@@ -354,7 +430,6 @@ def find_best_candidate(match: Dict[str, Any], events: List[Dict[str, Any]]) -> 
     for event in events:
         api_home = event.get("home_team")
         api_away = event.get("away_team")
-
         api_home_norm = normalize_team_name(api_home)
         api_away_norm = normalize_team_name(api_away)
 
@@ -370,7 +445,7 @@ def find_best_candidate(match: Dict[str, Any], events: List[Dict[str, Any]]) -> 
             [similarity_score(db_away_norm, api_away_norm)]
         )
 
-        total_score = (home_score + away_score) / 2.0
+        total_score = round((home_score + away_score) / 2.0, 4)
 
         if total_score > best_score:
             best_score = total_score
@@ -380,11 +455,52 @@ def find_best_candidate(match: Dict[str, Any], events: List[Dict[str, Any]]) -> 
                 "api_home_team_normalized": api_home_norm,
                 "api_away_team_normalized": api_away_norm,
                 "api_commence_time": parse_iso_ts(event.get("commence_time")),
-                "candidate_score": round(total_score, 4),
+                "candidate_score": total_score,
             }
 
     return best
 
+
+def should_store_candidate(
+    db_home_norm: str,
+    db_away_norm: str,
+    api_home_norm: str,
+    api_away_norm: str,
+    candidate_score: float,
+) -> bool:
+    """
+    Speichert nur echte Problemfälle.
+    Filtert kosmetische Unterschiede raus.
+    """
+    if not api_home_norm or not api_away_norm:
+        return False
+
+    # exakter Match -> uninteressant
+    if db_home_norm == api_home_norm and db_away_norm == api_away_norm:
+        return False
+
+    # fast identisch / kosmetisch -> uninteressant
+    if is_trivial_name_difference(db_home_norm, api_home_norm) and is_trivial_name_difference(db_away_norm, api_away_norm):
+        return False
+
+    # sehr hoher Score und beide Seiten sind substringish -> uninteressant
+    if (
+        candidate_score >= 0.95
+        and is_substringish(db_home_norm, api_home_norm)
+        and is_substringish(db_away_norm, api_away_norm)
+    ):
+        return False
+
+    # nur halbwegs plausible Kandidaten speichern
+    if candidate_score < 0.35:
+        return False
+
+    return True
+
+
+# -----------------------------------------------------------------------------
+# Insert
+# -----------------------------------------------------------------------------
 
 def insert_candidates(conn, rows: List[Tuple[Any, ...]]) -> int:
     if not rows:
@@ -423,6 +539,10 @@ def insert_candidates(conn, rows: List[Tuple[Any, ...]]) -> int:
     return len(rows)
 
 
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
 def main() -> None:
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = False
@@ -454,12 +574,17 @@ def main() -> None:
                 db_home_norm = normalize_team_name(match["home_team"])
                 db_away_norm = normalize_team_name(match["away_team"])
 
-                exact_match = (
-                    db_home_norm == best["api_home_team_normalized"] and
-                    db_away_norm == best["api_away_team_normalized"]
-                )
+                api_home_norm = best["api_home_team_normalized"]
+                api_away_norm = best["api_away_team_normalized"]
+                candidate_score = float(best["candidate_score"])
 
-                if exact_match:
+                if not should_store_candidate(
+                    db_home_norm=db_home_norm,
+                    db_away_norm=db_away_norm,
+                    api_home_norm=api_home_norm,
+                    api_away_norm=api_away_norm,
+                    candidate_score=candidate_score,
+                ):
                     continue
 
                 dedup_key = build_dedup_key(
@@ -481,11 +606,11 @@ def main() -> None:
                     db_away_norm,
                     best["api_home_team"],
                     best["api_away_team"],
-                    best["api_home_team_normalized"],
-                    best["api_away_team_normalized"],
+                    api_home_norm,
+                    api_away_norm,
                     sport_key,
                     best["api_commence_time"],
-                    best["candidate_score"],
+                    candidate_score,
                     "pending_review",
                     "auto-detected alias candidate",
                     dedup_key,
