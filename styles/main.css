@@ -1138,3 +1138,122 @@ footer { border-top: 1px solid var(--border); padding: 14px var(--sp-md); font-s
 .page, .page-history {
   overflow-x: hidden;
 }
+
+
+/* ══════════════════════════════════════════════════════════════
+   MARKET & VALUE
+══════════════════════════════════════════════════════════════ */
+
+.market-box {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  padding: 14px;
+  margin-bottom: 18px;
+}
+
+.market-box-empty {
+  text-align: center;
+  color: var(--t-secondary);
+}
+
+.market-empty-title {
+  font-weight: 800;
+  margin-bottom: 6px;
+  color: var(--t-primary);
+}
+
+.market-empty-text {
+  font-size: 13px;
+  color: var(--t-muted);
+}
+
+.market-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.market-head-title {
+  font-weight: 800;
+  color: var(--t-primary);
+}
+
+.market-head-meta {
+  font-size: 11px;
+  color: var(--t-muted);
+}
+
+.market-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.market-col {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px;
+  min-width: 0;
+}
+
+.market-col.is-value {
+  border-color: var(--lime-border);
+  box-shadow: 0 0 0 1px rgba(198,241,53,.18) inset;
+  background: var(--lime-dim);
+}
+
+.market-col-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--t-secondary);
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+
+.market-odds {
+  font-family: var(--f-display);
+  font-size: 28px;
+  font-weight: 900;
+  line-height: 1;
+  color: var(--lime);
+  margin-bottom: 8px;
+}
+
+.market-line {
+  font-size: 12px;
+  color: var(--t-secondary);
+  margin-top: 4px;
+}
+
+.market-badge {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(198,241,53,.16);
+  border: 1px solid rgba(198,241,53,.25);
+  color: var(--lime);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.market-footer {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--t-secondary);
+}
+
+@media (max-width: 520px) {
+  .market-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .market-odds {
+    font-size: 24px;
+  }
+}
