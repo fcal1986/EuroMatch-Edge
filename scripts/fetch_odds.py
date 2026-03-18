@@ -62,57 +62,130 @@ def normalize_text(value: Optional[str]) -> str:
     value = unicodedata.normalize("NFKD", value)
     value = "".join(ch for ch in value if not unicodedata.combining(ch))
 
-    value = re.sub(r"[^a-z0-9 ]+", " ", value)
+    value = re.sub(r"[^a-z0-9 /-]+", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
 
 
 def normalize_team_name(name: Optional[str]) -> str:
-    value = normalize_text(name)
+    if not name:
+        return ""
 
-    # Häufige Störwörter in Teamnamen entfernen
-    value = re.sub(r"\bfc\b", " ", value)
-    value = re.sub(r"\bsc\b", " ", value)
-    value = re.sub(r"\bsv\b", " ", value)
-    value = re.sub(r"\bev\b", " ", value)
-    value = re.sub(r"\bafc\b", " ", value)
-    value = re.sub(r"\bbc\b", " ", value)
-    value = re.sub(r"\bcf\b", " ", value)
-    value = re.sub(r"\bsk\b", " ", value)
-    value = re.sub(r"\bclube\b", " ", value)
-    value = re.sub(r"\batletico\b", "atletico", value)
-    value = re.sub(r"\b04\b", " ", value)
-    value = re.sub(r"\b1 fsv\b", " ", value)
-    value = re.sub(r"\b1 fc\b", " ", value)
+    value = name.lower().strip()
+
+    # Umlaute / Sonderzeichen
+    value = (
+        value.replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("ß", "ss")
+    )
+
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(c for c in value if not unicodedata.combining(c))
+
+    # Slash / Bindestrich vereinheitlichen
+    value = value.replace("/", " ")
+    value = value.replace("-", " ")
+
+    # Satzzeichen raus
+    value = re.sub(r"[^a-z0-9 ]+", " ", value)
+
+    # Club-/Suffix-Wörter entfernen
+    stopwords = {
+        "fc", "sc", "sv", "ev", "afc", "bc", "cf",
+        "sk", "fk", "club", "clube"
+    }
+    parts = [p for p in value.split() if p not in stopwords]
+    value = " ".join(parts)
+
+    # Harte Synonym-Normalisierung
+    replacements = {
+        "munich": "munchen",
+        "muenchen": "munchen",
+        "bayern munich": "bayern munchen",
+        "atalanta bc": "atalanta",
+        "atalanta bergamasca calcio": "atalanta",
+        "sporting cp": "sporting",
+        "sporting lisbon": "sporting",
+        "sporting portugal": "sporting",
+        "bodoe": "bodo",
+        "bodo glimt": "bodo glimt",
+    }
+
+    for src, dst in replacements.items():
+        value = value.replace(src, dst)
 
     value = re.sub(r"\s+", " ", value).strip()
     return value
 
 
 TEAM_ALIASES: Dict[str, List[str]] = {
-    "fc bayern munchen": ["bayern munich", "bayern munchen"],
-    "bayern munchen": ["bayern munich"],
-    "bayer leverkusen": ["bayer 04 leverkusen", "leverkusen"],
-    "sporting portugal": ["sporting clube de portugal", "sporting cp"],
-    "sporting clube de portugal": ["sporting portugal", "sporting cp"],
-    "paris saint germain": ["psg", "paris saint germain fc"],
-    "real madrid": ["real madrid cf"],
-    "barcelona": ["fc barcelona"],
-    "atletico madrid": ["club atletico de madrid", "atletico de madrid"],
-    "club atletico de madrid": ["atletico madrid", "atletico de madrid"],
-    "watford": ["watford fc"],
-    "wrexham": ["wrexham afc"],
-    "southampton": ["southampton fc"],
-    "norwich city": ["norwich city fc"],
-    "manchester city": ["manchester city fc"],
-    "chelsea": ["chelsea fc"],
-    "arsenal": ["arsenal fc"],
-    "newcastle united": ["newcastle united fc"],
-    "tottenham hotspur": ["tottenham hotspur fc", "spurs"],
-    "liverpool": ["liverpool fc"],
-    "galatasaray": ["galatasaray sk"],
-    "bodo glimt": ["fk bodo glimt", "bodo/glimt", "bodo glimt"],
-    "fk bodo glimt": ["bodo glimt", "bodo/glimt"],
+    "bayern munchen": [
+        "bayern",
+        "bayern munich",
+    ],
+    "atalanta": [
+        "atalanta bc",
+    ],
+    "sporting": [
+        "sporting clube de portugal",
+        "sporting cp",
+        "sporting lisbon",
+        "sporting portugal",
+    ],
+    "bodo glimt": [
+        "fk bodo glimt",
+        "bodo glimt",
+    ],
+    "paris saint germain": [
+        "psg",
+        "paris saint germain fc",
+    ],
+    "real madrid": [
+        "real madrid cf",
+    ],
+    "barcelona": [
+        "fc barcelona",
+    ],
+    "atletico madrid": [
+        "club atletico de madrid",
+        "atletico de madrid",
+    ],
+    "watford": [
+        "watford fc",
+    ],
+    "wrexham": [
+        "wrexham afc",
+    ],
+    "southampton": [
+        "southampton fc",
+    ],
+    "norwich city": [
+        "norwich city fc",
+    ],
+    "manchester city": [
+        "manchester city fc",
+    ],
+    "chelsea": [
+        "chelsea fc",
+    ],
+    "arsenal": [
+        "arsenal fc",
+    ],
+    "newcastle united": [
+        "newcastle united fc",
+    ],
+    "tottenham hotspur": [
+        "tottenham hotspur fc",
+        "spurs",
+    ],
+    "liverpool": [
+        "liverpool fc",
+    ],
+    "galatasaray": [
+        "galatasaray sk",
+    ],
 }
 
 
@@ -156,10 +229,6 @@ def fetch_available_sports() -> List[Dict[str, Any]]:
 
 
 def build_sport_lookup(available_sports: List[Dict[str, Any]]) -> Dict[str, str]:
-    """
-    Erstellt ein Lookup mit möglichst robusten Aliasen -> sport_key.
-    Bevorzugt Soccer-Wettbewerbe.
-    """
     alias_to_key: Dict[str, str] = {}
 
     for sport in available_sports:
@@ -183,7 +252,6 @@ def build_sport_lookup(available_sports: List[Dict[str, Any]]) -> Dict[str, str]
             key_norm,
         }
 
-        # Zusätzliche heuristische Aliase
         if "bundesliga" in title_norm or "bundesliga" in key_norm:
             aliases.update({"bundesliga", "germany bundesliga"})
         if "premier league" in title_norm or key == "soccer_epl":
@@ -216,15 +284,10 @@ def resolve_sport_key(
     country: Optional[str],
     sport_lookup: Dict[str, str],
 ) -> Optional[str]:
-    """
-    Leitet den passenden The-Odds-API sport_key aus competition_code/name/country ab.
-    """
-
     code_norm = normalize_text(competition_code)
     name_norm = normalize_text(competition_name)
     country_norm = normalize_text(country)
 
-    # Explizite interne Mappings deiner Competitions
     wanted_aliases = []
 
     if code_norm == "bundesliga":
@@ -246,7 +309,6 @@ def resolve_sport_key(
     elif code_norm == "championship":
         wanted_aliases += ["championship", "efl championship", "english championship"]
 
-    # Fallback über competition_name / country
     wanted_aliases += [
         name_norm,
         f"{country_norm} {name_norm}".strip(),
@@ -499,6 +561,30 @@ def extract_snapshot_rows(
         event = find_matching_event(match, events, event_lookup)
 
         if not event:
+            logger.warning(
+                "UNMATCHED DB MATCH | %s | %s vs %s",
+                match["competition_code"],
+                match["home_team"],
+                match["away_team"],
+            )
+            logger.warning(
+                "DB normalized      | home=%s | away=%s",
+                normalize_team_name(match["home_team"]),
+                normalize_team_name(match["away_team"]),
+            )
+            logger.warning(
+                "API candidates     | %s",
+                [
+                    {
+                        "home": e.get("home_team"),
+                        "away": e.get("away_team"),
+                        "home_norm": normalize_team_name(e.get("home_team")),
+                        "away_norm": normalize_team_name(e.get("away_team")),
+                    }
+                    for e in events[:20]
+                ],
+            )
+
             unmatched.append(
                 {
                     "competition_code": match["competition_code"],
