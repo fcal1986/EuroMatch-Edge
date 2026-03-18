@@ -54,6 +54,11 @@ const DataLayer = {
     });
     if (!response.ok) { const body = await response.text().catch(()=>''); throw new Error(`Supabase ${response.status}: ${body.slice(0,200)}`); }
     const raw = await response.json();
+
+    if (window.Debug?.success) {
+      Debug.success ('Supabase raw geladen', {count: raw.length, sample: raw[0]});
+    }
+    
     if (!Array.isArray(raw)) throw new Error('Supabase returned unexpected format');
     return Mapper.fromRows(raw);
   },
