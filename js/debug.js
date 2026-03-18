@@ -1,362 +1,413 @@
 'use strict';
 
-/* ── Debug HUD / Dialog ─────────────────────────────────────── */
+window.Debug = (() => {
+  const state = {
+    enabled: true,
+    panelOpen: false,
+    logs: [],
+    maxLogs: 300,
+    platform: detectPlatform(),
+    uiReady: false,
+  };
 
-const Debug = (() => {
-  let enabled = true;
-  let selectedMatchId = null;
-  let refreshTimer = null;
-
-  function el(id) {
-    return document.getElementById(id);
+  function detectPlatform() {
+    const ua = navigator.userAgent || '';
+    if (/Android/i.test(ua)) return 'Android';
+    if (/iPhone|iPad|iPod/i.test(ua)) return 'iOS';
+    if (/Windows/i.test(ua)) return 'Windows';
+    if (/Macintosh|Mac OS X/i.test(ua)) return 'macOS';
+    return 'Web';
   }
 
-  function safeJson(value) {
-    try {
-      return JSON.stringify(value, null, 2);
-    } catch {
-      return String(value);
-    }
+  function nowTime() {
+    const d = new Date();
+    const pad = (n, l = 2) => String(n).padStart(l, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
   }
 
-  function short(v) {
-    if (v === null) return 'null';
-    if (v === undefined) return 'undefined';
-    if (Array.isArray(v)) return `Array(${v.length})`;
-    if (typeof v === 'object') return 'object';
-    return String(v);
-  }
-
-  function boolCls(v) {
-    return v ? 'dbg-ok' : 'dbg-bad';
-  }
-
-  function row(label, value, ok = null) {
-    const cls = ok === null ? 'dbg-neutral' : (ok ? 'dbg-ok' : 'dbg-bad');
-    return `
-      <div class="dbg-row">
-        <div class="dbg-k">${label}</div>
-        <div class="dbg-v ${cls}">${value}</div>
-      </div>
-    `;
-  }
-
-  function section(title, inner) {
-    return `
-      <div class="dbg-section">
-        <div class="dbg-title">${title}</div>
-        ${inner}
-      </div>
-    `;
-  }
-
-  function findCurrentMatch() {
-    if (selectedMatchId && window.State?.allMatches) {
-      return State.allMatches.find(m => m.id === selectedMatchId) || null;
-    }
-    return null;
-  }
-
-  function getDrawerState() {
-    const overlay = el('drawer-overlay');
-    const drawer = el('drawer');
-    const body = el('drawer-body');
-
-    return {
-      jsOpen: !!window.Drawer?._isOpen,
-      clsOpen: !!overlay?.classList.contains('open'),
-      overlayVisible: overlay ? getComputedStyle(overlay).visibility : 'n/a',
-      overlayPE: overlay ? getComputedStyle(overlay).pointerEvents : 'n/a',
-      drawerDisplay: drawer ? getComputedStyle(drawer).display : 'n/a',
-      drawerHeight: drawer ? `${Math.round(drawer.getBoundingClientRect().height)}px` : 'n/a',
-      bodyScrollH: body ? body.scrollHeight : 'n/a',
-      bodyClientH: body ? body.clientHeight : 'n/a',
-      bodyOverflowY: body ? getComputedStyle(body).overflowY : 'n/a',
-    };
-  }
-
-  function inspectMatch(match) {
-    if (!match) {
-      return section('MATCH', row('selectedMatchId', short(selectedMatchId), false) +
-        row('match', 'nicht gefunden', false));
-    }
-
-    const market = match.market || null;
-    const hasMarketObj = !!market;
-    const hasOddsStruct = !!market?.odds;
-    const hasOddsValues = (
-      market?.odds?.home != null &&
-      market?.odds?.draw != null &&
-      market?.odds?.away != null
-    );
-
-    const models = window.ModelEngine?.run ? ModelEngine.run(match) : null;
-    const consensus = window.ModelEngine?.consensus ? ModelEngine.consensus(models) : null;
-    const mainModels = window.ModelEngine?.mainModels ? ModelEngine.mainModels(models) : null;
-    const aiAgent = window.ModelEngine?.agentResult ? ModelEngine.agentResult(models) : null;
-
-    const marketSection = section('MARKET', [
-      row('market obj', short(market), hasMarketObj),
-      row('market.odds', short(market?.odds), hasOddsStruct),
-      row('odds.home', short(market?.odds?.home), market?.odds?.home != null),
-      row('odds.draw', short(market?.odds?.draw), market?.odds?.draw != null),
-      row('odds.away', short(market?.odds?.away), market?.odds?.away != null),
-      row('probs.home', short(market?.probs?.home), market?.probs?.home != null),
-      row('edge.home', short(market?.edge?.home), market?.edge?.home != null),
-      row('ev.home', short(market?.ev?.home), market?.ev?.home != null),
-      row('value.home', short(market?.value?.home), market?.value?.home !== undefined),
-      row('has odds values', String(hasOddsValues), hasOddsValues),
-    ].join(''));
-
-    const modelSection = section('MODELS', [
-      row('ModelEngine.run', short(models), Array.isArray(models)),
-      row('models.length', short(models?.length), Array.isArray(models)),
-      row('consensus', short(consensus), !!consensus),
-      row('consensus.label', short(consensus?.label ?? consensus?.name ?? consensus?.tip), !!(consensus?.label ?? consensus?.name ?? consensus?.tip)),
-      row('mainModels', short(mainModels), Array.isArray(mainModels)),
-      row('mainModels.length', short(mainModels?.length), Array.isArray(mainModels)),
-      row('first model', short(mainModels?.[0]?.name ?? mainModels?.[0]?.label ?? mainModels?.[0]?.model), !!mainModels?.[0]),
-      row('aiAgent', short(aiAgent), !!aiAgent),
-      row('aiAgent.text', short(aiAgent?.text ?? aiAgent?.note ?? aiAgent?.reason), !!(aiAgent?.text ?? aiAgent?.note ?? aiAgent?.reason)),
-    ].join(''));
-
-    const coreSection = section('MATCH', [
-      row('id', match.id, true),
-      row('homeTeam', short(match.homeTeam), !!match.homeTeam),
-      row('awayTeam', short(match.awayTeam), !!match.awayTeam),
-      row('competition', short(match.competitionName), !!match.competitionName),
-      row('kickoffAt', short(match.kickoffAt), !!match.kickoffAt),
-      row('winProbability', short(match.winProbability), match.winProbability != null),
-      row('drawProbability', short(match.drawProbability), match.drawProbability != null),
-      row('awayProbability', short(match.awayProbability), match.awayProbability != null),
-      row('confidenceScore', short(match.confidenceScore), match.confidenceScore != null),
-      row('predictedWinner', short(match.predictedWinner), !!match.predictedWinner),
-    ].join(''));
-
-    const rawDump = section('RAW MATCH OBJECT', `
-      <pre class="dbg-pre">${escapeHtml(safeJson(match))}</pre>
-    `);
-
-    return coreSection + marketSection + modelSection + rawDump;
-  }
-
-  function escapeHtml(str) {
+  function esc(str) {
     return String(str)
       .replaceAll('&', '&amp;')
       .replaceAll('<', '&lt;')
       .replaceAll('>', '&gt;');
   }
 
-  function render() {
-    if (!enabled) return;
+  function iconFor(level) {
+    switch (level) {
+      case 'success': return '✅';
+      case 'warn': return '⚠️';
+      case 'error': return '❌';
+      case 'event': return '🔔';
+      case 'debug': return '🐞';
+      default: return 'ℹ️';
+    }
+  }
 
-    const root = el('debug-dialog-body');
-    if (!root) return;
+  function clsFor(level) {
+    switch (level) {
+      case 'success': return 'dbg-log-success';
+      case 'warn': return 'dbg-log-warn';
+      case 'error': return 'dbg-log-error';
+      case 'event': return 'dbg-log-event';
+      case 'debug': return 'dbg-log-debug';
+      default: return 'dbg-log-info';
+    }
+  }
 
-    const drawer = getDrawerState();
-    const match = findCurrentMatch();
+  function fmtData(data) {
+    if (data === undefined) return '';
+    if (typeof data === 'string') return data;
+    try {
+      return JSON.stringify(data);
+    } catch {
+      return String(data);
+    }
+  }
 
-    root.innerHTML =
-      section('DRAWER', [
-        row('open (JS)', String(drawer.jsOpen), drawer.jsOpen),
-        row('open (class)', String(drawer.clsOpen), drawer.clsOpen),
-        row('overlay visibility', drawer.overlayVisible, drawer.overlayVisible === 'visible'),
-        row('overlay pointerEvents', drawer.overlayPE, drawer.overlayPE !== 'none'),
-        row('drawer display', drawer.drawerDisplay, drawer.drawerDisplay !== 'none'),
-        row('drawer height', drawer.drawerHeight, true),
-        row('body scrollHeight', short(drawer.bodyScrollH), true),
-        row('body clientHeight', short(drawer.bodyClientH), true),
-        row('body overflowY', drawer.bodyOverflowY, true),
-      ].join('')) +
-      inspectMatch(match);
+  function push(level, message, data) {
+    const entry = {
+      ts: nowTime(),
+      level,
+      message,
+      data: fmtData(data),
+    };
+
+    state.logs.push(entry);
+    if (state.logs.length > state.maxLogs) {
+      state.logs.shift();
+    }
+
+    renderLogs();
+  }
+
+  function log(message, data) {
+    push('info', message, data);
+  }
+
+  function success(message, data) {
+    push('success', message, data);
+  }
+
+  function warn(message, data) {
+    push('warn', message, data);
+  }
+
+  function error(message, data) {
+    push('error', message, data);
+  }
+
+  function event(message, data) {
+    push('event', message, data);
+  }
+
+  function debug(message, data) {
+    push('debug', message, data);
+  }
+
+  function ensureStyles() {
+    if (document.getElementById('debug-styles')) return;
+
+    const style = document.createElement('style');
+    style.id = 'debug-styles';
+    style.textContent = `
+      .debug-fab {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        width: 64px;
+        height: 64px;
+        border-radius: 999px;
+        border: 3px solid #4f7cff;
+        background:
+          radial-gradient(circle at 30% 30%, rgba(79,124,255,.22), rgba(79,124,255,.08) 45%, rgba(0,0,0,.0) 70%),
+          #111a33;
+        color: #d8e6ff;
+        font-size: 28px;
+        line-height: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow:
+          0 0 0 2px rgba(79,124,255,.12),
+          0 0 28px rgba(79,124,255,.35),
+          0 12px 28px rgba(0,0,0,.35);
+        z-index: 99998;
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .debug-fab:active {
+        transform: scale(.97);
+      }
+
+      .debug-panel {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 99999;
+        background: linear-gradient(180deg, rgba(11,16,33,.98), rgba(6,10,20,.98));
+        border-top: 2px solid #4f7cff;
+        box-shadow: 0 -12px 32px rgba(0,0,0,.4);
+        transform: translateY(100%);
+        transition: transform .22s ease;
+        max-height: 52vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .debug-panel.open {
+        transform: translateY(0);
+      }
+
+      .debug-panel-head {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 12px 14px;
+        border-bottom: 1px solid rgba(255,255,255,.08);
+        background: rgba(255,255,255,.02);
+      }
+
+      .debug-panel-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 800;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+        color: #5f86ff;
+        white-space: nowrap;
+      }
+
+      .debug-panel-meta {
+        color: rgba(255,255,255,.6);
+        white-space: nowrap;
+      }
+
+      .debug-panel-spacer {
+        flex: 1;
+      }
+
+      .debug-btn {
+        height: 34px;
+        min-width: 34px;
+        padding: 0 12px;
+        border-radius: 10px;
+        border: 1px solid rgba(255,255,255,.12);
+        background: rgba(255,255,255,.04);
+        color: rgba(255,255,255,.85);
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      .debug-btn:active {
+        transform: scale(.98);
+      }
+
+      .debug-panel-body {
+        overflow: auto;
+        padding: 6px 0 12px 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .dbg-log {
+        display: grid;
+        grid-template-columns: 84px 22px 1fr;
+        gap: 8px;
+        padding: 6px 14px;
+        border-bottom: 1px solid rgba(255,255,255,.04);
+      }
+
+      .dbg-log-time {
+        color: rgba(255,255,255,.45);
+      }
+
+      .dbg-log-icon {
+        text-align: center;
+      }
+
+      .dbg-log-text {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .dbg-log-info .dbg-log-text { color: #cfd7ea; }
+      .dbg-log-success .dbg-log-text { color: #68e08a; }
+      .dbg-log-warn .dbg-log-text { color: #f4c25b; }
+      .dbg-log-error .dbg-log-text { color: #ff7d7d; }
+      .dbg-log-event .dbg-log-text { color: #c48bff; }
+      .dbg-log-debug .dbg-log-text { color: #63b3ff; }
+
+      .dbg-empty {
+        padding: 18px 14px;
+        color: rgba(255,255,255,.45);
+        text-align: center;
+      }
+    `;
+    document.head.appendChild(style);
   }
 
   function ensureUI() {
-    if (el('debug-dialog')) return;
+    if (state.uiReady) return;
 
-    const html = `
-      <div id="debug-dialog" class="debug-dialog hidden">
-        <div class="debug-dialog-card">
-          <div class="debug-dialog-head">
-            <div class="debug-dialog-title">EuroMatch Live Debug</div>
-            <div class="debug-dialog-actions">
-              <button id="debug-refresh-btn" class="debug-btn">Refresh</button>
-              <button id="debug-close-btn" class="debug-btn debug-btn-close">×</button>
-            </div>
-          </div>
-          <div id="debug-dialog-body" class="debug-dialog-body"></div>
-        </div>
+    ensureStyles();
+
+    const fab = document.createElement('button');
+    fab.id = 'debug-fab';
+    fab.className = 'debug-fab';
+    fab.type = 'button';
+    fab.title = 'Debug öffnen';
+    fab.innerHTML = '🐛';
+
+    const panel = document.createElement('div');
+    panel.id = 'debug-panel';
+    panel.className = 'debug-panel';
+    panel.innerHTML = `
+      <div class="debug-panel-head">
+        <div class="debug-panel-title">🐛 AUTH DEBUG</div>
+        <div class="debug-panel-meta" id="debug-panel-meta"></div>
+        <div class="debug-panel-spacer"></div>
+        <button id="debug-copy" class="debug-btn" type="button">COPY</button>
+        <button id="debug-clear" class="debug-btn" type="button">CLEAR</button>
+        <button id="debug-close" class="debug-btn" type="button">✕</button>
       </div>
-      <button id="debug-fab" class="debug-fab">🐞</button>
+      <div id="debug-panel-body" class="debug-panel-body"></div>
     `;
 
-    document.body.insertAdjacentHTML('beforeend', html);
+    document.body.appendChild(fab);
+    document.body.appendChild(panel);
 
-    el('debug-fab').addEventListener('click', open);
-    el('debug-close-btn').addEventListener('click', close);
-    el('debug-refresh-btn').addEventListener('click', render);
-    el('debug-dialog').addEventListener('click', (e) => {
-      if (e.target.id === 'debug-dialog') close();
-    });
+    fab.addEventListener('click', toggle);
+    panel.querySelector('#debug-close').addEventListener('click', close);
+    panel.querySelector('#debug-clear').addEventListener('click', clear);
+    panel.querySelector('#debug-copy').addEventListener('click', copyLogs);
+
+    updateMeta();
+    renderLogs();
+
+    state.uiReady = true;
   }
 
-  function injectStyles() {
-    if (el('debug-dialog-styles')) return;
-    const css = `
-      <style id="debug-dialog-styles">
-        .debug-dialog.hidden { display:none; }
-        .debug-dialog {
-          position: fixed;
-          inset: 0;
-          z-index: 99999;
-          background: rgba(0,0,0,.65);
-          display: flex;
-          align-items: flex-end;
-          justify-content: center;
-          padding: 12px;
-        }
-        .debug-dialog-card {
-          width: min(920px, 100%);
-          max-height: 88vh;
-          background: #081308;
-          border: 1px solid rgba(198,241,53,.35);
-          border-radius: 18px;
-          overflow: hidden;
-          box-shadow: 0 20px 80px rgba(0,0,0,.45);
-        }
-        .debug-dialog-head {
-          display:flex;
-          align-items:center;
-          justify-content:space-between;
-          gap:10px;
-          padding:14px 16px;
-          border-bottom:1px solid rgba(255,255,255,.08);
-        }
-        .debug-dialog-title {
-          color:#fff;
-          font-weight:800;
-          font-size:18px;
-        }
-        .debug-dialog-actions {
-          display:flex;
-          gap:8px;
-        }
-        .debug-btn {
-          border:1px solid rgba(198,241,53,.35);
-          background:#162516;
-          color:#d8ff66;
-          border-radius:10px;
-          padding:8px 12px;
-          font-weight:700;
-        }
-        .debug-btn-close {
-          color:#fff;
-          min-width:42px;
-        }
-        .debug-dialog-body {
-          overflow:auto;
-          max-height: calc(88vh - 58px);
-          padding: 14px;
-        }
-        .dbg-section {
-          margin-bottom: 14px;
-          border: 1px solid rgba(255,255,255,.07);
-          border-radius: 14px;
-          padding: 12px;
-          background: rgba(255,255,255,.02);
-        }
-        .dbg-title {
-          color:#d8ff66;
-          font-weight:800;
-          margin-bottom:10px;
-          letter-spacing:.04em;
-          text-transform:uppercase;
-          font-size:12px;
-        }
-        .dbg-row {
-          display:grid;
-          grid-template-columns: 160px 1fr;
-          gap:10px;
-          padding:6px 0;
-          border-bottom:1px solid rgba(255,255,255,.04);
-        }
-        .dbg-row:last-child { border-bottom:none; }
-        .dbg-k { color:#9fb39f; font-size:13px; }
-        .dbg-v { font-size:13px; word-break:break-word; }
-        .dbg-ok { color:#bfff72; }
-        .dbg-bad { color:#ff7d7d; }
-        .dbg-neutral { color:#fff; }
-        .dbg-pre {
-          margin:0;
-          white-space:pre-wrap;
-          word-break:break-word;
-          color:#d9e7d9;
-          font-size:12px;
-          line-height:1.45;
-        }
-        .debug-fab {
-          position: fixed;
-          right: 14px;
-          bottom: 14px;
-          z-index: 99998;
-          width: 52px;
-          height: 52px;
-          border-radius: 50%;
-          border: 1px solid rgba(198,241,53,.35);
-          background: #1b2c12;
-          color: #d8ff66;
-          font-size: 24px;
-          box-shadow: 0 10px 30px rgba(0,0,0,.35);
-        }
-        @media (max-width: 640px) {
-          .dbg-row {
-            grid-template-columns: 1fr;
-            gap: 4px;
-          }
-        }
-      </style>
-    `;
-    document.head.insertAdjacentHTML('beforeend', css);
+  function updateMeta() {
+    const meta = document.getElementById('debug-panel-meta');
+    if (!meta) return;
+    meta.textContent = `${window.innerWidth}×${window.innerHeight} | ${state.platform}`;
+  }
+
+  function renderLogs() {
+    const body = document.getElementById('debug-panel-body');
+    if (!body) return;
+
+    updateMeta();
+
+    if (!state.logs.length) {
+      body.innerHTML = `<div class="dbg-empty">Noch keine Logs vorhanden.</div>`;
+      return;
+    }
+
+    body.innerHTML = state.logs.map(item => `
+      <div class="dbg-log ${clsFor(item.level)}">
+        <div class="dbg-log-time">${esc(item.ts)}</div>
+        <div class="dbg-log-icon">${iconFor(item.level)}</div>
+        <div class="dbg-log-text">${esc(item.message)}${item.data ? `\n${esc(item.data)}` : ''}</div>
+      </div>
+    `).join('');
+
+    body.scrollTop = body.scrollHeight;
   }
 
   function open() {
     ensureUI();
-    injectStyles();
-    el('debug-dialog').classList.remove('hidden');
-    render();
-
-    if (!refreshTimer) {
-      refreshTimer = setInterval(render, 1200);
-    }
+    document.getElementById('debug-panel')?.classList.add('open');
+    state.panelOpen = true;
+    updateMeta();
   }
 
   function close() {
-    el('debug-dialog')?.classList.add('hidden');
-    if (refreshTimer) {
-      clearInterval(refreshTimer);
-      refreshTimer = null;
+    document.getElementById('debug-panel')?.classList.remove('open');
+    state.panelOpen = false;
+  }
+
+  function toggle() {
+    if (state.panelOpen) close();
+    else open();
+  }
+
+  function clear() {
+    state.logs = [];
+    renderLogs();
+    info('Debug-Log geleert');
+  }
+
+  async function copyLogs() {
+    const text = state.logs.map(item =>
+      `[${item.ts}] [${item.level.toUpperCase()}] ${item.message}${item.data ? ` | ${item.data}` : ''}`
+    ).join('\n');
+
+    try {
+      await navigator.clipboard.writeText(text);
+      success('Logs in Zwischenablage kopiert');
+    } catch (e) {
+      warn('Copy fehlgeschlagen', String(e));
     }
   }
 
-  function inspectMatchById(id) {
-    selectedMatchId = id;
-    if (!el('debug-dialog')) {
-      ensureUI();
-      injectStyles();
+  function info(message, data) {
+    log(message, data);
+  }
+
+  function inspectMatch(match) {
+    if (!match) {
+      warn('inspectMatch: kein Match übergeben');
+      return;
     }
-    render();
+
+    debug('Match geöffnet', {
+      id: match.id,
+      homeTeam: match.homeTeam,
+      awayTeam: match.awayTeam,
+      competitionName: match.competitionName,
+      winProbability: match.winProbability,
+      drawProbability: match.drawProbability,
+      awayProbability: match.awayProbability,
+      confidenceScore: match.confidenceScore,
+      predictedWinner: match.predictedWinner,
+      market: match.market || null,
+    });
   }
 
   function init() {
     ensureUI();
-    injectStyles();
+
+    info('Debug init gestartet');
+    info('Viewport erkannt', `${window.innerWidth}x${window.innerHeight}`);
+    info('UserAgent', navigator.userAgent);
+
+    window.addEventListener('resize', () => {
+      updateMeta();
+      debug('Resize', `${window.innerWidth}x${window.innerHeight}`);
+    });
+
+    success('Debug bereit');
   }
 
   return {
     init,
     open,
     close,
-    render,
-    inspectMatchById,
+    toggle,
+    clear,
+    copyLogs,
+    log,
+    info,
+    success,
+    warn,
+    error,
+    event,
+    debug,
+    inspectMatch,
   };
 })();
