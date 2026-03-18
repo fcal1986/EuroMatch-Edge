@@ -8,15 +8,10 @@
    - Drawer._isOpen
 ────────────────────────────────────────────────────────────────── */
 const Drawer = {
-
-  /* ── Interner State ──────────────────────────────────────── */
-  _isOpen:     false,
+  _isOpen: false,
   _escHandler: null,
-  _scrollY:    0,
+  _scrollY: 0,
 
-  /* ══════════════════════════════════════════════════════════
-     OPEN
-  ══════════════════════════════════════════════════════════ */
   open(id) {
     const m = State.allMatches.find(x => x.id === id);
     if (!m) return;
@@ -44,10 +39,10 @@ const Drawer = {
       `<span class="badge ${bCls}">${bLabel}</span>` +
       (m.riskTags || []).map(t => `<span class="rtag">${t}</span>`).join('');
 
-    const models     = State.modelsByMatch[m.id] || ModelEngine.run(m);
-    const ktipp      = ModelEngine.consensus(models);
-    const mainModels = ModelEngine.mainModels(models);
-    const aiAgent    = ModelEngine.agentResult(models);
+    const models = State.modelsByMatch[m.id] || ModelEngine.run(m) || [];
+    const ktipp = ModelEngine.consensus ? ModelEngine.consensus(models) : null;
+    const mainModels = ModelEngine.mainModels ? ModelEngine.mainModels(models) : [];
+    const aiAgent = ModelEngine.agentResult ? ModelEngine.agentResult(models) : null;
 
     const riskHtml = (m.riskTags && m.riskTags.length)
       ? m.riskTags.map(t => `<span class="rtag-d">${t}</span>`).join('')
@@ -57,16 +52,16 @@ const Drawer = {
       this._sectionProb(m, homeWin, awayWin) +
       this._sectionStrengthForm(m) +
       this._sectionMarket(m) +
-      (ktipp ? this._sectionKtipp(ktipp) : '') +
+      this._sectionKtipp(ktipp) +
       this._sectionModelGrid(mainModels) +
-      (aiAgent ? this._sectionAIAgent(aiAgent) : '') +
+      this._sectionAIAgent(aiAgent) +
       this._sectionRisk(riskHtml, m);
 
     this._scrollY = window.scrollY;
     document.body.style.overflow = 'hidden';
     document.body.style.position = 'fixed';
-    document.body.style.top      = `-${this._scrollY}px`;
-    document.body.style.width    = '100%';
+    document.body.style.top = `-${this._scrollY}px`;
+    document.body.style.width = '100%';
 
     document.getElementById('drawer-overlay').classList.add('open');
     this._isOpen = true;
@@ -78,7 +73,7 @@ const Drawer = {
     let swipeStartY = 0;
 
     const onTouchStart = (e) => { swipeStartY = e.touches[0].clientY; };
-    const onTouchMove  = (e) => {
+    const onTouchMove = (e) => {
       if (e.touches[0].clientY - swipeStartY > 70) this.close();
     };
 
@@ -86,13 +81,10 @@ const Drawer = {
       .forEach(el => {
         if (!el) return;
         el.addEventListener('touchstart', onTouchStart, { passive: true, once: true });
-        el.addEventListener('touchmove',  onTouchMove,  { passive: true, once: true });
+        el.addEventListener('touchmove', onTouchMove, { passive: true, once: true });
       });
   },
 
-  /* ══════════════════════════════════════════════════════════
-     CLOSE
-  ══════════════════════════════════════════════════════════ */
   close() {
     if (!this._isOpen) return;
 
@@ -106,14 +98,10 @@ const Drawer = {
 
     document.body.style.overflow = '';
     document.body.style.position = '';
-    document.body.style.top      = '';
-    document.body.style.width    = '';
+    document.body.style.top = '';
+    document.body.style.width = '';
     window.scrollTo(0, this._scrollY);
   },
-
-  /* ══════════════════════════════════════════════════════════
-     HELPERS
-  ══════════════════════════════════════════════════════════ */
 
   _fmtPct01(v) {
     if (v === null || v === undefined) return '–';
@@ -165,10 +153,6 @@ const Drawer = {
     return rows[0];
   },
 
-  /* ══════════════════════════════════════════════════════════
-     SECTION RENDERERS
-  ══════════════════════════════════════════════════════════ */
-
   _sectionProb(m, homeWin, awayWin) {
     return `
       <div class="sub-label">Siegwahrscheinlichkeit</div>
@@ -194,7 +178,9 @@ const Drawer = {
   },
 
   _sectionStrengthForm(m) {
-    const hasStrength = m.homeStrength !== null && m.awayStrength !== null;
+    const hasStrength = m.homeStrength !== null && m.homeStrength !== undefined &&
+      m.awayStrength !== null && m.awayStrength !== undefined;
+
     return `
       ${hasStrength ? `
         <div class="sub-label">Mannschaftsstärke</div>
@@ -222,7 +208,14 @@ const Drawer = {
   _sectionMarket(m) {
     const market = m.market;
 
-    if (!market || !market.hasOdds) {
+    const hasOdds =
+      market &&
+      market.odds &&
+      market.odds.home != null &&
+      market.odds.draw != null &&
+      market.odds.away != null;
+
+    if (!hasOdds) {
       return `
         <div class="sub-label">Markt & Value</div>
         <div class="market-box market-box-empty">
@@ -237,40 +230,38 @@ const Drawer = {
       <div class="sub-label">Markt & Value</div>
       <div class="market-box">
         <div class="market-head">
-          <div class="market-head-title">📈 Marktquoten</div>
+          <div class="market-head-title">📈 Markt</div>
           <div class="market-head-meta">
             ${market.bookmakerCount ?? '–'} Buchmacher
-            ${market.overround !== null && market.overround !== undefined
-              ? ` · Overround ${Number(market.overround).toFixed(3)}`
-              : ''}
+            ${market.overround != null ? ` · Overround ${Number(market.overround).toFixed(3)}` : ''}
           </div>
         </div>
 
         <div class="market-grid">
           <div class="market-col ${market.value?.home ? 'is-value' : ''}">
             <div class="market-col-title">${m.homeTeam}</div>
-            <div class="market-odds">${market.odds.home ?? '–'}</div>
-            <div class="market-line">Fair: ${this._fmtPct01(market.probs.home)}</div>
-            <div class="market-line">Edge: ${this._fmtPctSigned01(market.edge.home)}</div>
-            <div class="market-line">EV: ${this._fmtSigned(market.ev.home)}</div>
+            <div class="market-odds">${market.odds.home}</div>
+            <div class="market-line">Fair: ${this._fmtPct01(market.probs?.home)}</div>
+            <div class="market-line">Edge: ${this._fmtPctSigned01(market.edge?.home)}</div>
+            <div class="market-line">EV: ${this._fmtSigned(market.ev?.home)}</div>
             ${market.value?.home ? '<div class="market-badge">Value</div>' : ''}
           </div>
 
           <div class="market-col ${market.value?.draw ? 'is-value' : ''}">
             <div class="market-col-title">Remis</div>
-            <div class="market-odds">${market.odds.draw ?? '–'}</div>
-            <div class="market-line">Fair: ${this._fmtPct01(market.probs.draw)}</div>
-            <div class="market-line">Edge: ${this._fmtPctSigned01(market.edge.draw)}</div>
-            <div class="market-line">EV: ${this._fmtSigned(market.ev.draw)}</div>
+            <div class="market-odds">${market.odds.draw}</div>
+            <div class="market-line">Fair: ${this._fmtPct01(market.probs?.draw)}</div>
+            <div class="market-line">Edge: ${this._fmtPctSigned01(market.edge?.draw)}</div>
+            <div class="market-line">EV: ${this._fmtSigned(market.ev?.draw)}</div>
             ${market.value?.draw ? '<div class="market-badge">Value</div>' : ''}
           </div>
 
           <div class="market-col ${market.value?.away ? 'is-value' : ''}">
             <div class="market-col-title">${m.awayTeam}</div>
-            <div class="market-odds">${market.odds.away ?? '–'}</div>
-            <div class="market-line">Fair: ${this._fmtPct01(market.probs.away)}</div>
-            <div class="market-line">Edge: ${this._fmtPctSigned01(market.edge.away)}</div>
-            <div class="market-line">EV: ${this._fmtSigned(market.ev.away)}</div>
+            <div class="market-odds">${market.odds.away}</div>
+            <div class="market-line">Fair: ${this._fmtPct01(market.probs?.away)}</div>
+            <div class="market-line">Edge: ${this._fmtPctSigned01(market.edge?.away)}</div>
+            <div class="market-line">EV: ${this._fmtSigned(market.ev?.away)}</div>
             ${market.value?.away ? '<div class="market-badge">Value</div>' : ''}
           </div>
         </div>
@@ -286,20 +277,51 @@ const Drawer = {
   },
 
   _sectionKtipp(ktipp) {
+    if (!ktipp) return '';
+
+    const title =
+      ktipp.label ||
+      ktipp.name ||
+      'Konsens';
+
+    const weight =
+      ktipp.weight ??
+      ktipp.scoreWeight ??
+      5;
+
+    const primary =
+      ktipp.primary ||
+      ktipp.tip ||
+      ktipp.mainTip ||
+      '–';
+
+    const note =
+      ktipp.note ||
+      ktipp.text ||
+      ktipp.reason ||
+      'Keine Zusatzinfo verfügbar.';
+
     return `
       <div class="sub-label">Kicktipp-Empfehlung</div>
       <div class="kt-card">
         <div class="kt-top">
-          <div class="kt-title">⚽ ${ktipp.label}</div>
-          <div class="kt-weight">Gewicht ${ktipp.weight}/10</div>
+          <div class="kt-title">⚽ ${title}</div>
+          <div class="kt-weight">Gewicht ${weight}/10</div>
         </div>
-        <div class="kt-score">${ktipp.primary}</div>
-        <div class="kt-note">${ktipp.note}</div>
+        <div class="kt-score">${primary}</div>
+        <div class="kt-note">${note}</div>
       </div>`;
   },
 
   _sectionModelGrid(models) {
-    if (!models || !models.length) return '';
+    if (!Array.isArray(models) || !models.length) {
+      return `
+        <div class="sub-label">Modellvergleich</div>
+        <div class="model-card">
+          <div class="mc-text">Keine Modelldaten verfügbar.</div>
+        </div>`;
+    }
+
     return `
       <div class="sub-label">Modellvergleich</div>
       <div class="model-grid">
@@ -308,15 +330,54 @@ const Drawer = {
   },
 
   _modelCard(model) {
-    const tags = (model.tags || []).map(t => `<span class="mf">${t}</span>`).join('');
+    if (!model) return '';
+
+    const name =
+      model.name ||
+      model.label ||
+      model.model ||
+      'Modell';
+
+    const version =
+      model.version ||
+      model.ver ||
+      '';
+
+    const primary =
+      model.primary ||
+      model.tip ||
+      model.mainTip ||
+      '–';
+
+    const alternative =
+      model.alternative ||
+      model.alt ||
+      model.secondary ||
+      '–';
+
+    const confidence =
+      model.confidence ??
+      model.conf ??
+      null;
+
+    const text =
+      model.text ||
+      model.note ||
+      model.reason ||
+      '';
+
+    const tags = Array.isArray(model.tags)
+      ? model.tags.map(t => `<span class="mf">${t}</span>`).join('')
+      : '';
+
     const dist = Array.isArray(model.distribution) && model.distribution.length
       ? `
         <div class="mc-dist">
           ${model.distribution.map(d => `
             <div class="mc-dist-row">
-              <span>${d.score}</span>
-              <div class="mc-dist-bar"><i style="width:${d.prob}%"></i></div>
-              <span>${d.prob}%</span>
+              <span>${d.score ?? '–'}</span>
+              <div class="mc-dist-bar"><i style="width:${d.prob ?? 0}%"></i></div>
+              <span>${d.prob ?? 0}%</span>
             </div>`).join('')}
         </div>`
       : '';
@@ -324,27 +385,45 @@ const Drawer = {
     return `
       <div class="model-card">
         <div class="mc-head">
-          <div class="mc-name">${model.name}</div>
-          <div class="mc-ver">${model.version || ''}</div>
+          <div class="mc-name">${name}</div>
+          <div class="mc-ver">${version}</div>
         </div>
         <div class="mc-kpis">
-          <div><span>Haupttipp</span><strong>${model.primary || '–'}</strong></div>
-          <div><span>Alternative</span><strong>${model.alternative || '–'}</strong></div>
-          <div><span>Konfidenz</span><strong>${model.confidence ?? '–'}%</strong></div>
+          <div><span>Haupttipp</span><strong>${primary}</strong></div>
+          <div><span>Alternative</span><strong>${alternative}</strong></div>
+          <div><span>Konfidenz</span><strong>${confidence !== null ? `${confidence}%` : '–'}</strong></div>
         </div>
-        ${model.text ? `<div class="mc-text">${model.text}</div>` : ''}
+        ${text ? `<div class="mc-text">${text}</div>` : ''}
         ${dist}
         ${tags ? `<div class="mc-tags">${tags}</div>` : ''}
       </div>`;
   },
 
   _sectionAIAgent(ai) {
+    if (!ai) return '';
+
+    const text =
+      ai.text ||
+      ai.note ||
+      ai.reason ||
+      '–';
+
+    const tip =
+      ai.tip ||
+      ai.primary ||
+      '–';
+
+    const confidence =
+      ai.confidence ??
+      ai.conf ??
+      null;
+
     return `
       <div class="sub-label">AI Agent</div>
       <div class="ai-box">
         <div class="ai-title">Vorschau</div>
-        <div class="ai-text">${ai.text || '–'}</div>
-        <div class="ai-tip">Tipp: <strong>${ai.tip || '–'}</strong> · K: ${ai.confidence ?? '–'}%</div>
+        <div class="ai-text">${text}</div>
+        <div class="ai-tip">Tipp: <strong>${tip}</strong> · K: ${confidence !== null ? `${confidence}%` : '–'}</div>
       </div>`;
   },
 
