@@ -1,7 +1,7 @@
 """
 compute_predictions.py
 ──────────────────────
-EuroMatch Edge — Data Pipeline Step 2
+EuroMatch Edge — Data Pipeline Step 3
 
 Reads upcoming matches from Supabase `matches`, computes predictions
 using the MVP model, and upserts results into `predictions`.
@@ -14,12 +14,12 @@ Usage:
   python scripts/compute_predictions.py
   python scripts/compute_predictions.py --days-ahead 3
   python scripts/compute_predictions.py --dry-run
+  python scripts/compute_predictions.py --dirty-only
 """
 
 import argparse
 import json
 import logging
-import math
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -30,21 +30,33 @@ import requests
 # Runtime Metadata Layer
 try:
     from utils.runtime_metadata import (
-        get_system_version, start_pipeline_run, finish_pipeline_run,
+        get_system_version,
+        start_pipeline_run,
+        finish_pipeline_run,
         register_system_release,
     )
     _METADATA_AVAILABLE = True
 except ImportError:
-    # Fallback: metadata layer nicht verfügbar (z.B. beim direkten Aufruf ohne utils)
     import logging as _log
+
     _log.getLogger(__name__).warning(
         "utils.runtime_metadata not found — versioning disabled."
     )
-    def get_system_version(): return "dev"
-    def start_pipeline_run(j, **kw): return "no-run-id"
-    def finish_pipeline_run(r, **kw): pass
-    def register_system_release(**kw): pass
+
+    def get_system_version() -> str:
+        return "dev"
+
+    def start_pipeline_run(job_name: str, **kwargs: Any) -> str:
+        return "no-run-id"
+
+    def finish_pipeline_run(run_id: str, **kwargs: Any) -> None:
+        return None
+
+    def register_system_release(**kwargs: Any) -> None:
+        return None
+
     _METADATA_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────────
 # LOGGING
@@ -62,39 +74,61 @@ log = logging.getLogger(__name__)
 # MODEL CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-MODEL_VERSION       = os.environ.get("MODEL_VERSION", "1.0")
-CALIBRATION_VERSION = os.environ.get("CALIBRATION_VERSION", "1.0")  # bump when calibration is retrained
-WEIGHTS_VERSION     = os.environ.get("WEIGHTS_VERSION", "1.0")      # bump when WEIGHTS dict changes
+MODEL_VERSION = os.environ.get("MODEL_VERSION", "1.0")
+CALIBRATION_VERSION = os.environ.get("CALIBRATION_VERSION", "1.0")
+WEIGHTS_VERSION = os.environ.get("WEIGHTS_VERSION", "1.0")
 
-# Minimum win_probability to be flagged as a strong tip
 STRONG_TIP_THRESHOLD = 70
 
-# Model factor weights — must sum to 1.0
+# Must sum to ~1.0
 WEIGHTS = {
-    "strength":   0.36,
-    "form":       0.22,
-    "home_adv":   0.08,
-    "injuries":   0.12,
+    "strength": 0.36,
+    "form": 0.22,
+    "home_adv": 0.08,
+    "injuries": 0.12,
     "motivation": 0.10,
-    "load":       0.08,
-    "market":     0.04,
+    "load": 0.08,
+    "market": 0.04,
 }
 
-# How many factors must be estimable for full confidence
-# (fewer known factors → lower confidence_score)
 MAX_KNOWN_FACTORS = len(WEIGHTS)
 
-# Maps load_level_t enum values → numeric penalty applied to the leading team
 LOAD_PENALTY: dict[str, float] = {
-    "low":    0.00,
+    "low": 0.00,
     "medium": 0.03,
-    "high":   0.07,
+    "high": 0.07,
 }
 
-# Market signal (home win odds) → home strength bonus in [0, 1]
-# Lower odds = stronger market signal for home win
+MOTIVATION_HIGH = {
+    "titel",
+    "meister",
+    "scudetto",
+    "treble",
+    "ungeschlagen",
+    "abstieg",
+    "relegation",
+    "champions league",
+    "championship",
+    "cup final",
+    "finale",
+    "klassenerhalt",
+}
+
+# Value thresholds
+MIN_EDGE_FOR_VALUE = 0.02
+MIN_EV_FOR_VALUE = 0.03
+MIN_BOOKMAKER_COUNT_FOR_VALUE = 3
+
+
+# ─────────────────────────────────────────────────────────────
+# MARKET HELPERS
+# ─────────────────────────────────────────────────────────────
+
 def market_odds_to_score(odds: float | None) -> float | None:
-    """Convert decimal home-win odds to a [0,1] model score. Returns None if unavailable."""
+    """
+    Convert decimal home-win odds to a [0,1] model score.
+    Lower odds = stronger market signal for the home side.
+    """
     if odds is None:
         return None
     if odds <= 1.10:
@@ -110,6 +144,69 @@ def market_odds_to_score(odds: float | None) -> float | None:
     return 0.20
 
 
+def derive_market_metrics(match: dict[str, Any]) -> dict[str, Any]:
+    """
+    Compute fair market probabilities, overround, edge, EV and value flags.
+
+    Returns defaults (None / False) if full 1X2 odds are unavailable.
+    """
+    home_odds_raw = match.get("market_home_win_odds")
+    draw_odds_raw = match.get("market_draw_odds")
+    away_odds_raw = match.get("market_away_odds")
+    bookmaker_count = match.get("market_odds_bookmaker_count")
+    market_last_update_ts = match.get("market_odds_updated_at")
+
+    result = {
+        "market_home_prob_fair": None,
+        "market_draw_prob_fair": None,
+        "market_away_prob_fair": None,
+        "market_overround": None,
+        "market_bookmaker_count": bookmaker_count,
+        "market_last_update_ts": market_last_update_ts,
+        "edge_home": None,
+        "edge_draw": None,
+        "edge_away": None,
+        "ev_home": None,
+        "ev_draw": None,
+        "ev_away": None,
+        "value_home": False,
+        "value_draw": False,
+        "value_away": False,
+    }
+
+    if not home_odds_raw or not draw_odds_raw or not away_odds_raw:
+        return result
+
+    try:
+        home_odds = float(home_odds_raw)
+        draw_odds = float(draw_odds_raw)
+        away_odds = float(away_odds_raw)
+    except (TypeError, ValueError):
+        return result
+
+    if home_odds <= 1.0 or draw_odds <= 1.0 or away_odds <= 1.0:
+        return result
+
+    raw_home = 1.0 / home_odds
+    raw_draw = 1.0 / draw_odds
+    raw_away = 1.0 / away_odds
+    overround = raw_home + raw_draw + raw_away
+
+    if overround <= 0:
+        return result
+
+    fair_home = raw_home / overround
+    fair_draw = raw_draw / overround
+    fair_away = raw_away / overround
+
+    result["market_home_prob_fair"] = round(fair_home, 6)
+    result["market_draw_prob_fair"] = round(fair_draw, 6)
+    result["market_away_prob_fair"] = round(fair_away, 6)
+    result["market_overround"] = round(overround, 6)
+
+    return result
+
+
 # ─────────────────────────────────────────────────────────────
 # SUPABASE CLIENT
 # ─────────────────────────────────────────────────────────────
@@ -120,25 +217,16 @@ class SupabaseClient:
     def __init__(self, url: str, service_role_key: str) -> None:
         self.base_url = url.rstrip("/")
         self._auth_headers = {
-            "apikey":        service_role_key,
+            "apikey": service_role_key,
             "Authorization": f"Bearer {service_role_key}",
-            "Content-Type":  "application/json",
+            "Content-Type": "application/json",
         }
 
     # ── READ ──────────────────────────────────────────────────
 
     def fetch_upcoming_matches(self, date_from: str, date_to: str) -> list[dict[str, Any]]:
-        """
-        Return matches with kickoff_at >= date_from and kickoff_at < date_to (exclusive upper bound).
-        Both values are ISO 8601 strings with UTC timezone, microseconds stripped.
-
-        Uses requests params= dict so that special characters ('+', ':') in timestamps
-        are percent-encoded correctly — avoids HTTP 400 from malformed query strings.
-        Supabase REST allows duplicate param keys for multi-filter on the same column.
-        """
         url = f"{self.base_url}/rest/v1/matches"
 
-        # Strip microseconds for cleaner URLs: "2025-06-10T06:30:00+00:00" not "...123456+00:00"
         def _clean_ts(ts: str) -> str:
             try:
                 dt = datetime.fromisoformat(ts)
@@ -147,15 +235,13 @@ class SupabaseClient:
                 return ts
 
         ts_from = _clean_ts(date_from)
-        ts_to   = _clean_ts(date_to)
+        ts_to = _clean_ts(date_to)
 
-        # requests encodes params= automatically — no manual URL building needed.
-        # To pass two filters for the same key, use a list of (key, value) tuples.
         params = [
             ("kickoff_at", f"gte.{ts_from}"),
             ("kickoff_at", f"lt.{ts_to}"),
-            ("order",      "kickoff_at.asc"),
-            ("select",     "*"),
+            ("order", "kickoff_at.asc"),
+            ("select", "*"),
         ]
 
         log.info("  Fetching matches: %s → %s", ts_from, ts_to)
@@ -182,10 +268,6 @@ class SupabaseClient:
         return rows
 
     def fetch_dirty_matches(self, date_from: str, date_to: str) -> list[dict[str, Any]]:
-        """
-        Return only matches that are missing a prediction or whose prediction is stale.
-        Reads IDs from v_dirty_predictions and then loads the full rows from matches.
-        """
         dirty_url = f"{self.base_url}/rest/v1/v_dirty_predictions"
 
         def _clean_ts(ts: str) -> str:
@@ -196,7 +278,7 @@ class SupabaseClient:
                 return ts
 
         ts_from = _clean_ts(date_from)
-        ts_to   = _clean_ts(date_to)
+        ts_to = _clean_ts(date_to)
 
         params = [
             ("kickoff_at", f"gte.{ts_from}"),
@@ -263,23 +345,6 @@ class SupabaseClient:
     # ── WRITE ─────────────────────────────────────────────────
 
     def upsert_predictions(self, rows: list[dict[str, Any]]) -> None:
-        """
-        UPSERT prediction rows on conflict key `match_id`.
-
-        BEWUSSTE ENTSCHEIDUNG — Konfliktschlüssel ist nur match_id:
-          Die tägliche Pipeline überschreibt immer den neuesten Prognosestand
-          pro Match. Historische Versionen werden NICHT retained.
-          Begründung: upcoming matches werden täglich neu berechnet;
-          "latest prediction wins" ist das gewünschte Verhalten.
-          Für Multi-Version-History müsste der Schlüssel auf
-          (match_id, model_version) oder (match_id, pipeline_run_id)
-          umgestellt werden — geplant für Model Governance Agent v2.
-
-        PostgREST requires two things for a true upsert:
-          1. ?on_conflict=match_id  — tells PostgREST which column to conflict on
-          2. Prefer: resolution=merge-duplicates — tells it to UPDATE, not error
-        Without (1), PostgREST falls back to INSERT and raises 409 on duplicates.
-        """
         if not rows:
             return
 
@@ -288,6 +353,7 @@ class SupabaseClient:
             **self._auth_headers,
             "Prefer": "resolution=merge-duplicates,return=minimal",
         }
+
         response = requests.post(
             url,
             params={"on_conflict": "match_id"},
@@ -311,21 +377,19 @@ class SupabaseClient:
 # MODEL HELPERS
 # ─────────────────────────────────────────────────────────────
 
+def clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, value))
+
+
 def form_to_score(form: list[str]) -> float | None:
-    """
-    Convert a form array like ['W','W','D','L','W'] to a [0,1] score.
-    Returns None if form is empty (unknown).
-    W=3pts, D=1pt, L=0pts — normalised over 5 games * 3 max pts.
-    """
     if not form:
         return None
     max_pts = len(form) * 3
     pts = sum({"W": 3, "D": 1, "L": 0}.get(r, 0) for r in form)
-    return pts / max_pts
+    return pts / max_pts if max_pts > 0 else None
 
 
 def strength_to_score(strength: int | None) -> float | None:
-    """Normalise a 0–100 strength rating to [0,1]. Returns None if unknown."""
     if strength is None:
         return None
     return max(0.0, min(1.0, strength / 100.0))
@@ -336,61 +400,55 @@ def weighted_average(
     weights: dict[str, float],
 ) -> tuple[float, int]:
     """
-    Compute a weighted average of available (non-None) factors.
-
-    Returns:
-        (score, n_known)  where score ∈ [0,1] and n_known is the count of
-        factors that contributed (used to derive confidence_score).
-
-    Unknown factors are excluded from both numerator and denominator,
-    so the remaining weights are re-normalised automatically.
+    Compute weighted average of known factors only.
+    Returns (score, n_known_factors).
     """
-    total_weight = 0.0
-    total_value  = 0.0
-    n_known      = 0
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    n_known = 0
 
-    for name, value in factors.items():
+    for key, value in factors.items():
         if value is None:
             continue
-        w = weights.get(name, 0.0)
-        total_value  += value * w
-        total_weight += w
-        n_known      += 1
+        w = weights.get(key, 0.0)
+        weighted_sum += value * w
+        weight_sum += w
+        n_known += 1
 
-    if total_weight == 0.0:
-        # No data at all — fall back to coin-flip
-        return 0.5, 0
+    if weight_sum <= 0:
+        return 0.50, 0
 
-    return total_value / total_weight, n_known
-
-
-def clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, value))
+    return weighted_sum / weight_sum, n_known
 
 
-def normalise_to_100(home: float, draw: float, away: float) -> tuple[int, int, int]:
+def normalise_to_100(home_p: float, draw_p: float, away_p: float) -> tuple[int, int, int]:
     """
-    Scale three raw probability floats so they sum to exactly 100.
-    Uses largest-remainder (Hamilton) rounding to avoid off-by-one errors.
+    Convert three raw probabilities to integer percentages summing to exactly 100.
     """
-    total = home + draw + away
-    if total == 0:
+    total = home_p + draw_p + away_p
+    if total <= 0:
         return 34, 33, 33
 
-    raw = [home / total * 100, draw / total * 100, away / total * 100]
-    floored = [math.floor(v) for v in raw]
-    remainder = 100 - sum(floored)
+    vals = [home_p / total * 100.0, draw_p / total * 100.0, away_p / total * 100.0]
+    ints = [int(v) for v in vals]
+    remainder = 100 - sum(ints)
 
-    # Distribute remaining points to the values with largest fractional parts
-    fractions = sorted(
+    # Largest remainder method
+    frac_order = sorted(
         range(3),
-        key=lambda i: raw[i] - floored[i],
+        key=lambda i: (vals[i] - ints[i]),
         reverse=True,
     )
-    for i in range(remainder):
-        floored[fractions[i]] += 1
+    for i in frac_order[:remainder]:
+        ints[i] += 1
 
-    return floored[0], floored[1], floored[2]
+    return ints[0], ints[1], ints[2]
+
+
+def _inj_count_text(text: str) -> int:
+    if not text or text.strip().lower() in ("", "none", "keine", "-"):
+        return 0
+    return len([x for x in text.split(",") if x.strip()])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -399,82 +457,49 @@ def normalise_to_100(home: float, draw: float, away: float) -> tuple[int, int, i
 
 def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
     """
-    Compute a full prediction row for a single match dict.
-
-    Design principles:
-    - Every input field is treated as optional (None = unknown).
-    - The model degrades gracefully: fewer known inputs → lower confidence.
-    - The three output probabilities always sum to exactly 100.
-    - No external calls — pure function of the match dict.
+    Compute a full prediction row for one match dict.
     """
 
     # ── 1. Parse inputs ──────────────────────────────────────
 
-    home_str   = strength_to_score(match.get("home_strength"))
-    away_str   = strength_to_score(match.get("away_strength"))
-    form_h     = form_to_score(match.get("form_home") or [])
-    form_a     = form_to_score(match.get("form_away") or [])
+    home_str = strength_to_score(match.get("home_strength"))
+    away_str = strength_to_score(match.get("away_strength"))
+    form_h = form_to_score(match.get("form_home") or [])
+    form_a = form_to_score(match.get("form_away") or [])
     load_h_raw = match.get("load_home")
     load_a_raw = match.get("load_away")
-    market     = market_odds_to_score(match.get("market_home_win_odds"))
-    inj_h      = match.get("injuries_home") or ""
-    inj_a      = match.get("injuries_away") or ""
-    mot_h      = match.get("motivation_home") or ""
-    mot_a      = match.get("motivation_away") or ""
+    market = market_odds_to_score(match.get("market_home_win_odds"))
+    inj_h = match.get("injuries_home") or ""
+    inj_a = match.get("injuries_away") or ""
+    mot_h = match.get("motivation_home") or ""
+    mot_a = match.get("motivation_away") or ""
 
     # ── 2. Derive per-factor home scores [0,1] ───────────────
 
-    # Strength: home advantage expressed as fraction of combined strength
     if home_str is not None and away_str is not None:
         strength_score = home_str / (home_str + away_str + 1e-9)
     else:
         strength_score = None
 
-    # Form: relative home form
     if form_h is not None and form_a is not None:
-        form_score = (form_h + 0.5) / (form_h + form_a + 1.0)   # Laplace smoothing
+        form_score = (form_h + 0.5) / (form_h + form_a + 1.0)
     elif form_h is not None:
         form_score = clamp(form_h)
     else:
         form_score = None
 
-    # Fixed home advantage (always known)
-    home_adv_score: float = 0.52    # reduced home advantage baseline
+    home_adv_score: float = 0.52
 
-    # Injuries: symmetric — away injuries boost home score, home injuries lower it.
-    # Each side contributes independently; neutral (0.50) when both unknown.
-    def _inj_count(text: str) -> int | None:
-        """Return count of named absentees, or None if field is empty/unknown."""
-        if not text or text.strip().lower() in ("", "none", "keine", "-"):
-            return None
-        return len([x for x in text.split(",") if x.strip()])
+    inj_h_count = _inj_count_text(inj_h)
+    inj_a_count = _inj_count_text(inj_a)
 
-    inj_h_count = _inj_count(inj_h)
-    inj_a_count = _inj_count(inj_a)
-
-    if inj_h_count is None and inj_a_count is None:
-        injuries_score: float | None = None          # no data → factor excluded
+    if inj_h_count == 0 and inj_a_count == 0:
+        injuries_score: float | None = None
     else:
-        # Start from neutral 0.50; each away absence nudges home up, each home absence nudges down.
-        # Cap per side at ±0.20 (5 absences × 0.04) so a single team can't dominate the factor.
-        away_boost = min((inj_a_count or 0) * 0.04, 0.20)
-        home_drag  = min((inj_h_count or 0) * 0.04, 0.20)
-        injuries_score = clamp(0.50 + away_boost - home_drag)
+        injury_delta = (inj_a_count - inj_h_count) * 0.06
+        injuries_score = clamp(0.50 + injury_delta)
 
-    # Load: high away load = home advantage; high home load = home disadvantage
-    load_h_penalty = LOAD_PENALTY.get(load_h_raw or "", 0.0)
-    load_a_penalty = LOAD_PENALTY.get(load_a_raw or "", 0.0)
-    if load_h_raw is not None or load_a_raw is not None:
-        # Express as [0,1]: 0.5 = neutral; >0.5 = home benefit
-        load_score: float | None = clamp(0.5 - load_h_penalty + load_a_penalty)
-    else:
-        load_score = None
-
-    # Motivation: simple keyword heuristic
-    MOTIVATION_HIGH = {
-        "titel", "meister", "scudetto", "treble", "ungeschlagen",
-        "abstieg", "relegation", "chapionship", "cup final",
-    }
+    # Motivation heuristic
     def motivation_weight(text: str) -> float:
         lowered = text.lower()
         return 0.65 if any(k in lowered for k in MOTIVATION_HIGH) else 0.50
@@ -486,25 +511,34 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
     else:
         mot_score = None
 
-    # Market signal (already [0,1] via market_odds_to_score)
+    # Load penalty -> convert to score in [0,1] from home perspective
+    pen_h = LOAD_PENALTY.get(str(load_h_raw), 0.0) if load_h_raw is not None else None
+    pen_a = LOAD_PENALTY.get(str(load_a_raw), 0.0) if load_a_raw is not None else None
+
+    if pen_h is None and pen_a is None:
+        load_score: float | None = None
+    else:
+        pen_h_val = pen_h or 0.0
+        pen_a_val = pen_a or 0.0
+        load_score = clamp(0.50 + (pen_a_val - pen_h_val))
+
     market_score = market
 
     # ── 3. Weighted composite home score ─────────────────────
 
     factors: dict[str, float | None] = {
-        "strength":   strength_score,
-        "form":       form_score,
-        "home_adv":   home_adv_score,   # always present
-        "injuries":   injuries_score,
+        "strength": strength_score,
+        "form": form_score,
+        "home_adv": home_adv_score,
+        "injuries": injuries_score,
         "motivation": mot_score,
-        "load":       load_score,
-        "market":     market_score,
+        "load": load_score,
+        "market": market_score,
     }
 
     home_score, n_known = weighted_average(factors, WEIGHTS)
 
-    # Symmetry-Fix against home bias:
-    # if the away team is stronger, reduce the home score proportionally.
+    # Symmetry fix against home bias
     if home_str is not None and away_str is not None:
         diff = away_str - home_str
         if diff > 0:
@@ -513,31 +547,26 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
     home_score = clamp(home_score, 0.02, 0.95)
 
     # ── 4. Derive draw and away probabilities ─────────────────
-    # home_score IS the win probability directly.
-    # Draw probability decays exponentially as the match becomes more one-sided.
-    # This mirrors real-world 1X2 market distributions.
-    #   draw_base = 0.27  (average draw rate in top European leagues)
-    #   k = 3.5           (decay rate — tuned so draw ~8% at home_score=0.90)
-    import math as _math
-    _draw_base = 0.27
-    _k         = 3.5
-    raw_draw = _draw_base * _math.exp(-_k * abs(home_score - 0.5))
-    raw_draw = max(0.06, raw_draw)                   # floor: draws never truly zero
+
+    draw_base = 0.27
+    k = 3.5
+    raw_draw = draw_base * pow(2.718281828, (-k * abs(home_score - 0.5)))
+    raw_draw = max(0.06, raw_draw)
     raw_away = max(0.03, 1.0 - home_score - raw_draw)
 
     win_p, draw_p, away_p = normalise_to_100(home_score, raw_draw, raw_away)
 
-    # ── 5. Derived output fields ──────────────────────────────
+    # ── 5. Winner / strong tip ────────────────────────────────
 
     if win_p >= away_p and win_p >= draw_p:
         predicted_winner = "home"
-        leading_prob     = win_p
+        leading_prob = win_p
     elif away_p >= win_p and away_p >= draw_p:
         predicted_winner = "away"
-        leading_prob     = away_p
+        leading_prob = away_p
     else:
         predicted_winner = "draw"
-        leading_prob     = draw_p
+        leading_prob = draw_p
 
     is_strong_tip = leading_prob >= STRONG_TIP_THRESHOLD
 
@@ -551,8 +580,10 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         risk_tags.append("Hohe Spielplan-Belastung Heim")
     if load_a_raw == "high":
         risk_tags.append("Hohe Spielplan-Belastung Auswärts")
-    if inj_h and len([x for x in inj_h.split(",") if x.strip()]) >= 2:
+    if inj_h_count >= 2:
         risk_tags.append("Mehrere Ausfälle Heim")
+    if inj_a_count >= 2:
+        risk_tags.append("Mehrere Ausfälle Auswärts")
     if form_h is not None and form_a is not None and abs(form_h - form_a) < 0.15:
         risk_tags.append("Ausgeglichene Form")
     home_strength_raw = match.get("home_strength")
@@ -567,7 +598,7 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         risk_tags.append("Markt favorisiert Auswärtsteam")
 
     n_risk = len(risk_tags)
-    if n_risk >= 3 or (n_known <= 1):
+    if n_risk >= 3 or n_known <= 1:
         risk_level = "high"
     elif n_risk >= 1:
         risk_level = "medium"
@@ -575,15 +606,15 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         risk_level = "low"
 
     # ── 7. Confidence score ───────────────────────────────────
-    # Blend of: data completeness + outcome conviction + risk
-    data_completeness  = n_known / MAX_KNOWN_FACTORS        # [0,1]
-    outcome_conviction = abs(leading_prob - 50) / 50        # [0,1]
-    risk_penalty       = n_risk * 0.05                      # each tag costs 5%
+
+    data_completeness = n_known / MAX_KNOWN_FACTORS
+    outcome_conviction = abs(leading_prob - 50) / 50
+    risk_penalty = n_risk * 0.05
 
     raw_confidence = (
-        data_completeness  * 0.50 +
-        outcome_conviction * 0.40 -
-        risk_penalty
+        data_completeness * 0.50
+        + outcome_conviction * 0.40
+        - risk_penalty
     )
     confidence_score = int(clamp(raw_confidence, 0.0, 1.0) * 100)
 
@@ -593,36 +624,118 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
     away_team = match.get("away_team", "Auswärts")
 
     analysis_text = _build_analysis_text(
-        home_team, away_team, win_p, draw_p, away_p,
-        predicted_winner, is_strong_tip, n_known,
-    )
-
-    ai_reason = _build_ai_reason(
-        home_team, away_team, predicted_winner,
-        home_str, away_str, form_h, form_a,
-        load_h_raw, load_a_raw, inj_h, inj_a,
+        home_team,
+        away_team,
+        win_p,
+        draw_p,
+        away_p,
+        predicted_winner,
+        is_strong_tip,
         n_known,
     )
 
-    return {
-        "match_id":         match["id"],
-        "win_probability":  win_p,
+    ai_reason = _build_ai_reason(
+        home_team,
+        away_team,
+        predicted_winner,
+        home_str,
+        away_str,
+        form_h,
+        form_a,
+        load_h_raw,
+        load_a_raw,
+        inj_h,
+        inj_a,
+        n_known,
+    )
+
+    pred = {
+        "match_id": match["id"],
+        "win_probability": win_p,
         "draw_probability": draw_p,
         "away_probability": away_p,
         "confidence_score": confidence_score,
         "predicted_winner": predicted_winner,
-        "is_strong_tip":    is_strong_tip,
-        "risk_level":       risk_level,
-        "risk_tags":        risk_tags,
-        "analysis_text":    analysis_text,
-        "ai_reason":        ai_reason,
-        "model_version":        MODEL_VERSION,
-        "calibration_version":  CALIBRATION_VERSION,
-        "weights_version":       WEIGHTS_VERSION,
-        # Filled by run() after pipeline_run_id is known:
-        "system_version":        None,
-        "pipeline_run_id":       None,
+        "is_strong_tip": is_strong_tip,
+        "risk_level": risk_level,
+        "risk_tags": risk_tags,
+        "analysis_text": analysis_text,
+        "ai_reason": ai_reason,
+        "model_version": MODEL_VERSION,
+        "calibration_version": CALIBRATION_VERSION,
+        "weights_version": WEIGHTS_VERSION,
+        "system_version": None,
+        "pipeline_run_id": None,
+        # Filled later
+        "market_home_prob_fair": None,
+        "market_draw_prob_fair": None,
+        "market_away_prob_fair": None,
+        "market_overround": None,
+        "market_bookmaker_count": None,
+        "market_last_update_ts": None,
+        "edge_home": None,
+        "edge_draw": None,
+        "edge_away": None,
+        "ev_home": None,
+        "ev_draw": None,
+        "ev_away": None,
+        "value_home": False,
+        "value_draw": False,
+        "value_away": False,
     }
+
+    pred = enrich_with_market_metrics(match, pred)
+    return pred
+
+
+def enrich_with_market_metrics(match: dict[str, Any], pred: dict[str, Any]) -> dict[str, Any]:
+    """
+    Add fair market probabilities, overround, edge, EV and value flags.
+    """
+    market_metrics = derive_market_metrics(match)
+
+    for key, value in market_metrics.items():
+        pred[key] = value
+
+    if pred["market_home_prob_fair"] is None:
+        return pred
+
+    home_odds = float(match["market_home_win_odds"])
+    draw_odds = float(match["market_draw_odds"])
+    away_odds = float(match["market_away_odds"])
+
+    model_home = (pred.get("win_probability") or 0) / 100.0
+    model_draw = (pred.get("draw_probability") or 0) / 100.0
+    model_away = (pred.get("away_probability") or 0) / 100.0
+
+    fair_home = float(pred["market_home_prob_fair"])
+    fair_draw = float(pred["market_draw_prob_fair"])
+    fair_away = float(pred["market_away_prob_fair"])
+
+    edge_home = model_home - fair_home
+    edge_draw = model_draw - fair_draw
+    edge_away = model_away - fair_away
+
+    ev_home = model_home * home_odds - 1.0
+    ev_draw = model_draw * draw_odds - 1.0
+    ev_away = model_away * away_odds - 1.0
+
+    pred["edge_home"] = round(edge_home, 6)
+    pred["edge_draw"] = round(edge_draw, 6)
+    pred["edge_away"] = round(edge_away, 6)
+
+    pred["ev_home"] = round(ev_home, 6)
+    pred["ev_draw"] = round(ev_draw, 6)
+    pred["ev_away"] = round(ev_away, 6)
+
+    bookmaker_count = pred.get("market_bookmaker_count") or 0
+    has_market_depth = bookmaker_count >= MIN_BOOKMAKER_COUNT_FOR_VALUE
+
+    pred["value_home"] = bool(has_market_depth and edge_home >= MIN_EDGE_FOR_VALUE and ev_home >= MIN_EV_FOR_VALUE)
+    pred["value_draw"] = bool(has_market_depth and edge_draw >= MIN_EDGE_FOR_VALUE and ev_draw >= MIN_EV_FOR_VALUE)
+    pred["value_away"] = bool(has_market_depth and edge_away >= MIN_EDGE_FOR_VALUE and ev_away >= MIN_EV_FOR_VALUE)
+
+    return pred
 
 
 # ─────────────────────────────────────────────────────────────
@@ -639,7 +752,6 @@ def _build_analysis_text(
     is_strong_tip: bool,
     n_known: int,
 ) -> str:
-    """One-sentence factual summary for the match card."""
     if n_known <= 1:
         return f"{home} vs {away} – zu wenig Daten für eine verlässliche Einschätzung."
 
@@ -674,14 +786,12 @@ def _build_ai_reason(
     inj_a: str,
     n_known: int,
 ) -> str:
-    """Structured reasoning text for the detail drawer."""
     if n_known == 0:
         return "Keine Eingangsdaten verfügbar. Vorhersage basiert ausschließlich auf dem allgemeinen Heimvorteil."
 
     winner_name = home if predicted_winner == "home" else (away if predicted_winner == "away" else "Unentschieden")
     reasons: list[str] = []
 
-    # Strength
     if home_str is not None and away_str is not None:
         diff = abs(int(home_str * 100) - int(away_str * 100))
         if diff >= 20:
@@ -693,7 +803,6 @@ def _build_ai_reason(
         else:
             reasons.append("Beide Teams sind im Stärkevergleich nahezu gleichwertig.")
 
-    # Form
     if form_h is not None and form_a is not None:
         fh_pct = int(form_h * 100)
         fa_pct = int(form_a * 100)
@@ -703,17 +812,10 @@ def _build_ai_reason(
         else:
             reasons.append(f"Die aktuelle Form beider Teams ist ähnlich ({fh_pct}% vs {fa_pct}%).")
 
-    # Load
     if load_h == "high" and load_a != "high":
         reasons.append(f"{home} kommt mit hoher Spielplan-Belastung in diese Partie.")
     elif load_a == "high" and load_h != "high":
         reasons.append(f"{away} reist mit hoher Spielplan-Belastung an – Vorteil für {home}.")
-
-    # Injuries — use the same count logic as the model
-    def _inj_count_text(text: str) -> int | None:
-        if not text or text.strip().lower() in ("", "none", "keine", "-"):
-            return None
-        return len([x for x in text.split(",") if x.strip()])
 
     inj_a_count = _inj_count_text(inj_a)
     inj_h_count = _inj_count_text(inj_h)
@@ -722,7 +824,6 @@ def _build_ai_reason(
     if inj_h_count:
         reasons.append(f"{home} hat {inj_h_count} Ausfälle zu beklagen.")
 
-    # Home advantage (always mention)
     reasons.append(f"Heimvorteil fliesst grundsätzlich zu Gunsten von {home} in die Berechnung ein.")
 
     if not reasons:
@@ -759,20 +860,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def load_env() -> tuple[str, str]:
-    supabase_url = os.environ.get("SUPABASE_URL",              "").strip()
-    service_key  = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    supabase_url = os.environ.get("SUPABASE_URL", "").strip()
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
     missing = [
         name for name, val in [
-            ("SUPABASE_URL",              supabase_url),
+            ("SUPABASE_URL", supabase_url),
             ("SUPABASE_SERVICE_ROLE_KEY", service_key),
         ]
         if not val
     ]
     if missing:
-        raise RuntimeError(
-            f"Missing required environment variables: {', '.join(missing)}"
-        )
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
     return supabase_url, service_key
 
@@ -782,9 +881,9 @@ def load_env() -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────
 
 def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
-    now       = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     date_from = now.isoformat()
-    date_to   = (now + timedelta(days=days_ahead)).isoformat()
+    date_to = (now + timedelta(days=days_ahead)).isoformat()
 
     log.info("═══════════════════════════════════════════════")
     log.info("EuroMatch Edge — compute_predictions.py")
@@ -797,7 +896,7 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
     log.info("═══════════════════════════════════════════════")
 
     _sys_version = get_system_version()
-    _run_id      = start_pipeline_run(
+    _run_id = start_pipeline_run(
         "compute_predictions",
         system_version=_sys_version,
         metadata={"days_ahead": days_ahead, "dry_run": dry_run, "dirty_only": dirty_only},
@@ -810,7 +909,6 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
         supabase_url, service_key = load_env()
         sb = SupabaseClient(supabase_url, service_key)
 
-        # ── Fetch matches
         try:
             if dirty_only:
                 matches = sb.fetch_dirty_matches(date_from, date_to)
@@ -831,21 +929,16 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
             )
             return
 
-        # ── Compute predictions
         now_utc = datetime.now(timezone.utc)
-        predictions:    list[dict[str, Any]] = []
-        compute_errors: list[str]            = []
-        skipped_past:   int                  = 0
+        predictions: list[dict[str, Any]] = []
+        compute_errors: list[str] = []
+        skipped_past = 0
 
         for match in matches:
-            match_id  = match.get("id", "?")
+            match_id = match.get("id", "?")
             home_team = match.get("home_team", "?")
             away_team = match.get("away_team", "?")
 
-            # Guard: skip any match that has already kicked off.
-            # The Supabase query filters by kickoff_at >= now, but rows whose kickoff_at
-            # was in the future when fetched could slip through if the pipeline runs slowly,
-            # or if stale rows land in the table from a manual insert.
             kickoff_raw = match.get("kickoff_at")
             if kickoff_raw:
                 try:
@@ -853,7 +946,9 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
                     if kickoff_dt <= now_utc:
                         log.warning(
                             "  ⏭ Skipping past match: %s vs %s (kickoff %s)",
-                            home_team, away_team, kickoff_raw,
+                            home_team,
+                            away_team,
+                            kickoff_raw,
                         )
                         skipped_past += 1
                         continue
@@ -868,10 +963,15 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
                 pred = compute_prediction(match)
                 predictions.append(pred)
                 log.info(
-                    "  ✓ %s vs %s  →  home %d%%  draw %d%%  away %d%%  conf %d%%  %s",
-                    home_team, away_team,
-                    pred["win_probability"], pred["draw_probability"], pred["away_probability"],
+                    "  ✓ %s vs %s  →  home %d%%  draw %d%%  away %d%%  conf %d%%  edge_h=%s ev_h=%s %s",
+                    home_team,
+                    away_team,
+                    pred["win_probability"],
+                    pred["draw_probability"],
+                    pred["away_probability"],
                     pred["confidence_score"],
+                    pred.get("edge_home"),
+                    pred.get("ev_home"),
                     "⚡ STRONG" if pred["is_strong_tip"] else "",
                 )
             except Exception as exc:  # noqa: BLE001
@@ -883,9 +983,11 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
 
         computed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         for p in predictions:
-            p["system_version"]  = _sys_version
+            p["system_version"] = _sys_version
             p["pipeline_run_id"] = _run_id
-            p["computed_at"]     = computed_at
+            p["computed_at"] = computed_at
+            p["created_at"] = computed_at
+            p["updated_at"] = computed_at
 
         if dry_run:
             log.info("[DRY RUN] Would upsert %d row(s).", len(predictions))
@@ -899,6 +1001,12 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
                 raise RuntimeError(f"Supabase upsert failed: {exc}") from exc
 
         strong_tips = sum(1 for p in predictions if p["is_strong_tip"])
+        value_flags = sum(
+            1
+            for p in predictions
+            if p.get("value_home") or p.get("value_draw") or p.get("value_away")
+        )
+
         log.info("═══════════════════════════════════════════════")
         log.info("SUMMARY")
         log.info("  Matches fetched    : %d", len(matches))
@@ -906,6 +1014,7 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
         log.info("  Skipped (past)     : %d", skipped_past)
         log.info("  Predictions built  : %d", len(predictions))
         log.info("  Strong tips (≥%d%%): %d", STRONG_TIP_THRESHOLD, strong_tips)
+        log.info("  Value flags        : %d", value_flags)
         log.info("  Compute errors     : %d", len(compute_errors))
 
         if compute_errors:
@@ -920,6 +1029,7 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
         log.info("  System version     : %s", _sys_version)
         log.info("  Pipeline run ID    : %s", _run_id)
         log.info("═══════════════════════════════════════════════")
+
         finish_pipeline_run(
             _run_id,
             status="success",
@@ -929,13 +1039,20 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
                 "skipped_past": skipped_past,
                 "dry_run": dry_run,
                 "dirty_only": dirty_only,
+                "value_flags": value_flags,
             },
         )
+
     except Exception as exc:
         finish_pipeline_run(
             _run_id,
             status="failed",
-            metadata={"error": str(exc), "days_ahead": days_ahead, "dry_run": dry_run, "dirty_only": dirty_only},
+            metadata={
+                "error": str(exc),
+                "days_ahead": days_ahead,
+                "dry_run": dry_run,
+                "dirty_only": dirty_only,
+            },
         )
         log.error("Pipeline failed: %s", exc)
         sys.exit(1)
