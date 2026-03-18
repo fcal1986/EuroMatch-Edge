@@ -179,9 +179,6 @@ def similarity_score(a: str, b: str) -> float:
 
 
 def is_substringish(a: str, b: str) -> bool:
-    """
-    Prüft, ob ein Name im anderen enthalten ist.
-    """
     if not a or not b:
         return False
     return a in b or b in a
@@ -190,9 +187,10 @@ def is_substringish(a: str, b: str) -> bool:
 def is_trivial_name_difference(a: str, b: str) -> bool:
     """
     Filtert kosmetische Unterschiede raus:
-    - hoher Score
-    - oder gleiche Tokenmenge
-    - oder Teilstring-Beziehung
+    - gleiche Normalform
+    - sehr hoher Token-Overlap
+    - gleiche Tokenmenge
+    - Teilstring + hohe Überlappung
     """
     if not a or not b:
         return False
@@ -200,14 +198,18 @@ def is_trivial_name_difference(a: str, b: str) -> bool:
     if a == b:
         return True
 
+    tokens_a = token_set(a)
+    tokens_b = token_set(b)
+
+    if tokens_a == tokens_b:
+        return True
+
     score = similarity_score(a, b)
-    if score >= 0.95:
+
+    if score >= 0.90:
         return True
 
-    if token_set(a) == token_set(b):
-        return True
-
-    if is_substringish(a, b) and score >= 0.75:
+    if is_substringish(a, b) and score >= 0.70:
         return True
 
     return False
@@ -475,23 +477,21 @@ def should_store_candidate(
     if not api_home_norm or not api_away_norm:
         return False
 
-    # exakter Match -> uninteressant
+    # Exakter oder trivialer Unterschied -> nicht speichern
     if db_home_norm == api_home_norm and db_away_norm == api_away_norm:
         return False
 
-    # fast identisch / kosmetisch -> uninteressant
-    if is_trivial_name_difference(db_home_norm, api_home_norm) and is_trivial_name_difference(db_away_norm, api_away_norm):
-        return False
-
-    # sehr hoher Score und beide Seiten sind substringish -> uninteressant
     if (
-        candidate_score >= 0.95
-        and is_substringish(db_home_norm, api_home_norm)
-        and is_substringish(db_away_norm, api_away_norm)
+        is_trivial_name_difference(db_home_norm, api_home_norm)
+        and is_trivial_name_difference(db_away_norm, api_away_norm)
     ):
         return False
 
-    # nur halbwegs plausible Kandidaten speichern
+    # Sehr hoher Score -> meist nur kosmetischer Unterschied
+    if candidate_score >= 0.95:
+        return False
+
+    # Sehr schwache Kandidaten ignorieren
     if candidate_score < 0.35:
         return False
 
