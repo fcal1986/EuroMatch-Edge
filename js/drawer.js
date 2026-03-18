@@ -16,6 +16,10 @@ const Drawer = {
     const m = State.allMatches.find(x => x.id === id);
     if (!m) return;
 
+    if (window.Debug?.inspectWatch) {
+         Debug.inspectWatch(m); 
+    }
+
     const homeWin = m.predictedWinner === 'home';
     const awayWin = m.predictedWinner === 'away';
     const [bCls, bLabel] = badgeInfo(m);
