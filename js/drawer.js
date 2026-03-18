@@ -13,86 +13,166 @@ const Drawer = {
   _scrollY: 0,
 
   open(id) {
-    const m = State.allMatches.find(x => x.id === id);
-    if (!m) return;
+    try {
+      if (window.Debug?.info) {
+        Debug.info('Drawer.open() aufgerufen', { id });
+      }
 
-    if (window.Debug?.inspectWatch) {
-         Debug.inspectWatch(m); 
+      const m = State.allMatches.find(x => x.id === id);
+
+      if (!m) {
+        if (window.Debug?.warn) {
+          Debug.warn('Drawer: Match nicht gefunden', {
+            id,
+            stateCount: State?.allMatches?.length ?? 0
+          });
+        }
+        return;
+      }
+
+      if (window.Debug?.inspectMatch) {
+        Debug.inspectMatch(m);
+      }
+
+      if (window.Debug?.debug) {
+        Debug.debug('Drawer Match gefunden', {
+          id: m.id,
+          homeTeam: m.homeTeam,
+          awayTeam: m.awayTeam,
+          competitionName: m.competitionName,
+          confidenceScore: m.confidenceScore,
+          predictedWinner: m.predictedWinner,
+          market: m.market || null
+        });
+      }
+
+      const homeWin = m.predictedWinner === 'home';
+      const awayWin = m.predictedWinner === 'away';
+      const [bCls, bLabel] = badgeInfo(m);
+
+      const weekday = m.kickoffAt
+        ? m.kickoffAt.toLocaleDateString('de-DE', { weekday: 'long' })
+        : '';
+
+      document.getElementById('drawer-league').innerHTML =
+        (weekday
+          ? `<span class="dh-weekday">${weekday}</span><span class="dh-sep">·</span>`
+          : '') +
+        `${m.flag} <span>${m.competitionName}</span>` +
+        `<span class="dh-sep">·</span>` +
+        `<span class="dh-time">${fmtTime(m.kickoffAt)} Uhr</span>`;
+
+      document.getElementById('dh-teams').textContent =
+        `${m.homeTeam}  ×  ${m.awayTeam}`;
+
+      document.getElementById('dh-tags').innerHTML =
+        `<span class="badge ${bCls}">${bLabel}</span>` +
+        (m.riskTags || []).map(t => `<span class="rtag">${t}</span>`).join('');
+
+      const models = State.modelsByMatch[m.id] || (ModelEngine.run ? ModelEngine.run(m) : []) || [];
+      const ktipp = ModelEngine.consensus ? ModelEngine.consensus(models) : null;
+      const mainModels = ModelEngine.mainModels ? ModelEngine.mainModels(models) : [];
+      const aiAgent = ModelEngine.agentResult ? ModelEngine.agentResult(models) : null;
+
+      if (window.Debug?.debug) {
+        Debug.debug('Drawer ModelEngine Output', {
+          modelsType: Array.isArray(models) ? 'array' : typeof models,
+          modelsLength: Array.isArray(models) ? models.length : null,
+          consensus: ktipp || null,
+          mainModelsLength: Array.isArray(mainModels) ? mainModels.length : null,
+          firstModel: Array.isArray(mainModels) && mainModels.length ? mainModels[0] : null,
+          aiAgent: aiAgent || null
+        });
+      }
+
+      const riskHtml = (m.riskTags && m.riskTags.length)
+        ? m.riskTags.map(t => `<span class="rtag-d">${t}</span>`).join('')
+        : '<span class="rtag-ok">✓ Keine Risiken erkannt</span>';
+
+      const html =
+        this._sectionProb(m, homeWin, awayWin) +
+        this._sectionStrengthForm(m) +
+        this._sectionMarket(m) +
+        this._sectionKtipp(ktipp) +
+        this._sectionModelGrid(mainModels) +
+        this._sectionAIAgent(aiAgent) +
+        this._sectionRisk(riskHtml, m);
+
+      document.getElementById('drawer-body').innerHTML = html;
+
+      if (window.Debug?.success) {
+        Debug.success('Drawer HTML gerendert', {
+          htmlLength: html.length,
+          hasMarket: !!m.market,
+          hasOdds: !!(m.market && m.market.odds),
+          hasModels: Array.isArray(mainModels) && mainModels.length > 0
+        });
+      }
+
+      this._scrollY = window.scrollY;
+      document.body.style.overflow = 'hidden';
+      document.body.style.position = 'fixed';
+      document.body.style.top = `-${this._scrollY}px`;
+      document.body.style.width = '100%';
+
+      document.getElementById('drawer-overlay').classList.add('open');
+      this._isOpen = true;
+
+      this._escHandler = (e) => {
+        if (e.key === 'Escape') this.close();
+      };
+      document.addEventListener('keydown', this._escHandler);
+
+      const dr = document.getElementById('drawer');
+      let swipeStartY = 0;
+
+      const onTouchStart = (e) => {
+        swipeStartY = e.touches[0].clientY;
+      };
+
+      const onTouchMove = (e) => {
+        if (e.touches[0].clientY - swipeStartY > 70) this.close();
+      };
+
+      [dr.querySelector('.drawer-handle'), dr.querySelector('.drawer-head')]
+        .forEach(el => {
+          if (!el) return;
+          el.addEventListener('touchstart', onTouchStart, { passive: true, once: true });
+          el.addEventListener('touchmove', onTouchMove, { passive: true, once: true });
+        });
+
+      if (window.Debug?.success) {
+        Debug.success('Drawer geöffnet', {
+          id: m.id,
+          overlayOpen: document.getElementById('drawer-overlay')?.classList.contains('open'),
+          drawerOpen: this._isOpen
+        });
+      }
+    } catch (err) {
+      if (window.Debug?.error) {
+        Debug.error('Drawer.open() Fehler', {
+          id,
+          message: err?.message || String(err),
+          stack: err?.stack || null
+        });
+      }
+      throw err;
     }
-
-    const homeWin = m.predictedWinner === 'home';
-    const awayWin = m.predictedWinner === 'away';
-    const [bCls, bLabel] = badgeInfo(m);
-
-    const weekday = m.kickoffAt
-      ? m.kickoffAt.toLocaleDateString('de-DE', { weekday: 'long' })
-      : '';
-
-    document.getElementById('drawer-league').innerHTML =
-      (weekday
-        ? `<span class="dh-weekday">${weekday}</span><span class="dh-sep">·</span>`
-        : '') +
-      `${m.flag} <span>${m.competitionName}</span>` +
-      `<span class="dh-sep">·</span>` +
-      `<span class="dh-time">${fmtTime(m.kickoffAt)} Uhr</span>`;
-
-    document.getElementById('dh-teams').textContent =
-      `${m.homeTeam}  ×  ${m.awayTeam}`;
-
-    document.getElementById('dh-tags').innerHTML =
-      `<span class="badge ${bCls}">${bLabel}</span>` +
-      (m.riskTags || []).map(t => `<span class="rtag">${t}</span>`).join('');
-
-    const models = State.modelsByMatch[m.id] || ModelEngine.run(m) || [];
-    const ktipp = ModelEngine.consensus ? ModelEngine.consensus(models) : null;
-    const mainModels = ModelEngine.mainModels ? ModelEngine.mainModels(models) : [];
-    const aiAgent = ModelEngine.agentResult ? ModelEngine.agentResult(models) : null;
-
-    const riskHtml = (m.riskTags && m.riskTags.length)
-      ? m.riskTags.map(t => `<span class="rtag-d">${t}</span>`).join('')
-      : '<span class="rtag-ok">✓ Keine Risiken erkannt</span>';
-
-    document.getElementById('drawer-body').innerHTML =
-      this._sectionProb(m, homeWin, awayWin) +
-      this._sectionStrengthForm(m) +
-      this._sectionMarket(m) +
-      this._sectionKtipp(ktipp) +
-      this._sectionModelGrid(mainModels) +
-      this._sectionAIAgent(aiAgent) +
-      this._sectionRisk(riskHtml, m);
-
-    this._scrollY = window.scrollY;
-    document.body.style.overflow = 'hidden';
-    document.body.style.position = 'fixed';
-    document.body.style.top = `-${this._scrollY}px`;
-    document.body.style.width = '100%';
-
-    document.getElementById('drawer-overlay').classList.add('open');
-    this._isOpen = true;
-
-    this._escHandler = (e) => { if (e.key === 'Escape') this.close(); };
-    document.addEventListener('keydown', this._escHandler);
-
-    const dr = document.getElementById('drawer');
-    let swipeStartY = 0;
-
-    const onTouchStart = (e) => { swipeStartY = e.touches[0].clientY; };
-    const onTouchMove = (e) => {
-      if (e.touches[0].clientY - swipeStartY > 70) this.close();
-    };
-
-    [dr.querySelector('.drawer-handle'), dr.querySelector('.drawer-head')]
-      .forEach(el => {
-        if (!el) return;
-        el.addEventListener('touchstart', onTouchStart, { passive: true, once: true });
-        el.addEventListener('touchmove', onTouchMove, { passive: true, once: true });
-      });
   },
 
   close() {
-    if (!this._isOpen) return;
+    if (window.Debug?.info) {
+      Debug.info('Drawer.close() aufgerufen');
+    }
 
-    document.getElementById('drawer-overlay').classList.remove('open');
+    if (!this._isOpen) {
+      if (window.Debug?.warn) {
+        Debug.warn('Drawer.close(): Drawer war bereits geschlossen');
+      }
+      return;
+    }
+
+    document.getElementById('drawer-overlay')?.classList.remove('open');
     this._isOpen = false;
 
     if (this._escHandler) {
@@ -105,6 +185,12 @@ const Drawer = {
     document.body.style.top = '';
     document.body.style.width = '';
     window.scrollTo(0, this._scrollY);
+
+    if (window.Debug?.success) {
+      Debug.success('Drawer geschlossen', {
+        scrollRestore: this._scrollY
+      });
+    }
   },
 
   _fmtPct01(v) {
@@ -182,7 +268,8 @@ const Drawer = {
   },
 
   _sectionStrengthForm(m) {
-    const hasStrength = m.homeStrength !== null && m.homeStrength !== undefined &&
+    const hasStrength =
+      m.homeStrength !== null && m.homeStrength !== undefined &&
       m.awayStrength !== null && m.awayStrength !== undefined;
 
     return `
@@ -212,6 +299,10 @@ const Drawer = {
   _sectionMarket(m) {
     const market = m.market;
 
+    if (window.Debug?.debug) {
+      Debug.debug('Drawer._sectionMarket input', market || null);
+    }
+
     const hasOdds =
       market &&
       market.odds &&
@@ -220,6 +311,12 @@ const Drawer = {
       market.odds.away != null;
 
     if (!hasOdds) {
+      if (window.Debug?.warn) {
+        Debug.warn('Drawer Marktblock: keine Odds vorhanden', {
+          market: market || null
+        });
+      }
+
       return `
         <div class="sub-label">Markt & Value</div>
         <div class="market-box market-box-empty">
@@ -229,6 +326,18 @@ const Drawer = {
     }
 
     const topValue = this._pickTopValue(m);
+
+    if (window.Debug?.success) {
+      Debug.success('Drawer Marktblock: Odds vorhanden', {
+        odds: market.odds,
+        probs: market.probs,
+        edge: market.edge,
+        ev: market.ev,
+        value: market.value,
+        bookmakerCount: market.bookmakerCount,
+        overround: market.overround
+      });
+    }
 
     return `
       <div class="sub-label">Markt & Value</div>
@@ -281,6 +390,10 @@ const Drawer = {
   },
 
   _sectionKtipp(ktipp) {
+    if (window.Debug?.debug) {
+      Debug.debug('Drawer._sectionKtipp input', ktipp || null);
+    }
+
     if (!ktipp) return '';
 
     const title =
@@ -318,7 +431,19 @@ const Drawer = {
   },
 
   _sectionModelGrid(models) {
+    if (window.Debug?.debug) {
+      Debug.debug('Drawer._sectionModelGrid input', {
+        isArray: Array.isArray(models),
+        length: Array.isArray(models) ? models.length : null,
+        sample: Array.isArray(models) && models.length ? models[0] : null
+      });
+    }
+
     if (!Array.isArray(models) || !models.length) {
+      if (window.Debug?.warn) {
+        Debug.warn('Drawer Modellvergleich: keine Modelldaten');
+      }
+
       return `
         <div class="sub-label">Modellvergleich</div>
         <div class="model-card">
@@ -335,6 +460,10 @@ const Drawer = {
 
   _modelCard(model) {
     if (!model) return '';
+
+    if (window.Debug?.debug) {
+      Debug.debug('Drawer._modelCard input', model);
+    }
 
     const name =
       model.name ||
@@ -404,6 +533,10 @@ const Drawer = {
   },
 
   _sectionAIAgent(ai) {
+    if (window.Debug?.debug) {
+      Debug.debug('Drawer._sectionAIAgent input', ai || null);
+    }
+
     if (!ai) return '';
 
     const text =
