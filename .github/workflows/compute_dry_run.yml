@@ -20,7 +20,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Dry run compute predictions
-        run: python scripts/compute_predictions.py --dirty-only --dry-run
+        run: python scripts/compute_predictions.py --dry-run --days-ahead 2
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
