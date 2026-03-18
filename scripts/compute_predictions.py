@@ -114,10 +114,11 @@ MOTIVATION_HIGH = {
     "klassenerhalt",
 }
 
-# Value thresholds
-MIN_EDGE_FOR_VALUE = 0.02
-MIN_EV_FOR_VALUE = 0.03
-MIN_BOOKMAKER_COUNT_FOR_VALUE = 3
+# Strengere Value thresholds
+MIN_EDGE_FOR_VALUE = 0.03
+MIN_EV_FOR_VALUE = 0.05
+MIN_BOOKMAKER_COUNT_FOR_VALUE = 5
+MIN_CONFIDENCE_FOR_VALUE = 35
 
 
 # ─────────────────────────────────────────────────────────────
@@ -221,8 +222,6 @@ class SupabaseClient:
             "Authorization": f"Bearer {service_role_key}",
             "Content-Type": "application/json",
         }
-
-    # ── READ ──────────────────────────────────────────────────
 
     def fetch_upcoming_matches(self, date_from: str, date_to: str) -> list[dict[str, Any]]:
         url = f"{self.base_url}/rest/v1/matches"
@@ -342,8 +341,6 @@ class SupabaseClient:
         log.info("  → %d dirty match(es) loaded.", len(rows))
         return rows
 
-    # ── WRITE ─────────────────────────────────────────────────
-
     def upsert_predictions(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
@@ -399,10 +396,6 @@ def weighted_average(
     factors: dict[str, float | None],
     weights: dict[str, float],
 ) -> tuple[float, int]:
-    """
-    Compute weighted average of known factors only.
-    Returns (score, n_known_factors).
-    """
     weighted_sum = 0.0
     weight_sum = 0.0
     n_known = 0
@@ -422,9 +415,6 @@ def weighted_average(
 
 
 def normalise_to_100(home_p: float, draw_p: float, away_p: float) -> tuple[int, int, int]:
-    """
-    Convert three raw probabilities to integer percentages summing to exactly 100.
-    """
     total = home_p + draw_p + away_p
     if total <= 0:
         return 34, 33, 33
@@ -433,7 +423,6 @@ def normalise_to_100(home_p: float, draw_p: float, away_p: float) -> tuple[int, 
     ints = [int(v) for v in vals]
     remainder = 100 - sum(ints)
 
-    # Largest remainder method
     frac_order = sorted(
         range(3),
         key=lambda i: (vals[i] - ints[i]),
@@ -456,12 +445,6 @@ def _inj_count_text(text: str) -> int:
 # ─────────────────────────────────────────────────────────────
 
 def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
-    """
-    Compute a full prediction row for one match dict.
-    """
-
-    # ── 1. Parse inputs ──────────────────────────────────────
-
     home_str = strength_to_score(match.get("home_strength"))
     away_str = strength_to_score(match.get("away_strength"))
     form_h = form_to_score(match.get("form_home") or [])
@@ -473,8 +456,6 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
     inj_a = match.get("injuries_away") or ""
     mot_h = match.get("motivation_home") or ""
     mot_a = match.get("motivation_away") or ""
-
-    # ── 2. Derive per-factor home scores [0,1] ───────────────
 
     if home_str is not None and away_str is not None:
         strength_score = home_str / (home_str + away_str + 1e-9)
@@ -499,7 +480,6 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         injury_delta = (inj_a_count - inj_h_count) * 0.06
         injuries_score = clamp(0.50 + injury_delta)
 
-    # Motivation heuristic
     def motivation_weight(text: str) -> float:
         lowered = text.lower()
         return 0.65 if any(k in lowered for k in MOTIVATION_HIGH) else 0.50
@@ -511,7 +491,6 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
     else:
         mot_score = None
 
-    # Load penalty -> convert to score in [0,1] from home perspective
     pen_h = LOAD_PENALTY.get(str(load_h_raw), 0.0) if load_h_raw is not None else None
     pen_a = LOAD_PENALTY.get(str(load_a_raw), 0.0) if load_a_raw is not None else None
 
@@ -523,8 +502,6 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         load_score = clamp(0.50 + (pen_a_val - pen_h_val))
 
     market_score = market
-
-    # ── 3. Weighted composite home score ─────────────────────
 
     factors: dict[str, float | None] = {
         "strength": strength_score,
@@ -538,15 +515,12 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
 
     home_score, n_known = weighted_average(factors, WEIGHTS)
 
-    # Symmetry fix against home bias
     if home_str is not None and away_str is not None:
         diff = away_str - home_str
         if diff > 0:
             home_score -= diff * 0.25
 
     home_score = clamp(home_score, 0.02, 0.95)
-
-    # ── 4. Derive draw and away probabilities ─────────────────
 
     draw_base = 0.27
     k = 3.5
@@ -555,8 +529,6 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
     raw_away = max(0.03, 1.0 - home_score - raw_draw)
 
     win_p, draw_p, away_p = normalise_to_100(home_score, raw_draw, raw_away)
-
-    # ── 5. Winner / strong tip ────────────────────────────────
 
     if win_p >= away_p and win_p >= draw_p:
         predicted_winner = "home"
@@ -569,8 +541,6 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         leading_prob = draw_p
 
     is_strong_tip = leading_prob >= STRONG_TIP_THRESHOLD
-
-    # ── 6. Risk level & tags ──────────────────────────────────
 
     risk_tags: list[str] = []
 
@@ -605,8 +575,6 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
     else:
         risk_level = "low"
 
-    # ── 7. Confidence score ───────────────────────────────────
-
     data_completeness = n_known / MAX_KNOWN_FACTORS
     outcome_conviction = abs(leading_prob - 50) / 50
     risk_penalty = n_risk * 0.05
@@ -617,8 +585,6 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         - risk_penalty
     )
     confidence_score = int(clamp(raw_confidence, 0.0, 1.0) * 100)
-
-    # ── 8. Text outputs ───────────────────────────────────────
 
     home_team = match.get("home_team", "Heim")
     away_team = match.get("away_team", "Auswärts")
@@ -666,7 +632,6 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
         "weights_version": WEIGHTS_VERSION,
         "system_version": None,
         "pipeline_run_id": None,
-        # Filled later
         "market_home_prob_fair": None,
         "market_draw_prob_fair": None,
         "market_away_prob_fair": None,
@@ -689,9 +654,6 @@ def compute_prediction(match: dict[str, Any]) -> dict[str, Any]:
 
 
 def enrich_with_market_metrics(match: dict[str, Any], pred: dict[str, Any]) -> dict[str, Any]:
-    """
-    Add fair market probabilities, overround, edge, EV and value flags.
-    """
     market_metrics = derive_market_metrics(match)
 
     for key, value in market_metrics.items():
@@ -729,11 +691,28 @@ def enrich_with_market_metrics(match: dict[str, Any], pred: dict[str, Any]) -> d
     pred["ev_away"] = round(ev_away, 6)
 
     bookmaker_count = pred.get("market_bookmaker_count") or 0
+    confidence_score = pred.get("confidence_score") or 0
     has_market_depth = bookmaker_count >= MIN_BOOKMAKER_COUNT_FOR_VALUE
+    has_confidence = confidence_score >= MIN_CONFIDENCE_FOR_VALUE
 
-    pred["value_home"] = bool(has_market_depth and edge_home >= MIN_EDGE_FOR_VALUE and ev_home >= MIN_EV_FOR_VALUE)
-    pred["value_draw"] = bool(has_market_depth and edge_draw >= MIN_EDGE_FOR_VALUE and ev_draw >= MIN_EV_FOR_VALUE)
-    pred["value_away"] = bool(has_market_depth and edge_away >= MIN_EDGE_FOR_VALUE and ev_away >= MIN_EV_FOR_VALUE)
+    pred["value_home"] = bool(
+        has_market_depth
+        and has_confidence
+        and edge_home >= MIN_EDGE_FOR_VALUE
+        and ev_home >= MIN_EV_FOR_VALUE
+    )
+    pred["value_draw"] = bool(
+        has_market_depth
+        and has_confidence
+        and edge_draw >= MIN_EDGE_FOR_VALUE
+        and ev_draw >= MIN_EV_FOR_VALUE
+    )
+    pred["value_away"] = bool(
+        has_market_depth
+        and has_confidence
+        and edge_away >= MIN_EDGE_FOR_VALUE
+        and ev_away >= MIN_EV_FOR_VALUE
+    )
 
     return pred
 
@@ -974,7 +953,7 @@ def run(days_ahead: int, dry_run: bool, dirty_only: bool) -> None:
                     pred.get("ev_home"),
                     "⚡ STRONG" if pred["is_strong_tip"] else "",
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 err = f"match {match_id} ({home_team} vs {away_team}): {exc}"
                 log.error("  ✗ Failed to compute prediction — %s", err)
                 compute_errors.append(err)
