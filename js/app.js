@@ -166,4 +166,9 @@ const App = {
 };
 
 /* ── Boot ────────────────────────────────────────────────────── */
-document.addEventListener('DOMContentLoaded', () => App.init());
+document.addEventListener('DOMContentLoaded', () => {
+  App.init()
+
+  if (window.Debug?.init) {
+      Debug.init();
+  });
