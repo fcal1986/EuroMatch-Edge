@@ -171,4 +171,5 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if (window.Debug?.init) {
       Debug.init();
+  }
   });
