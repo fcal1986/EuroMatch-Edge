@@ -1,173 +1,362 @@
 'use strict';
 
-/* ── Debug HUD ───────────────────────────────────────────────────
-   Aktivierung:    URL-Hash #debug  ODER  10× Logo tippen
-   Deaktivierung:  URL-Hash #debug  ODER  ✕-Button im HUD
+/* ── Debug HUD / Dialog ─────────────────────────────────────── */
 
-   Zeigt live (alle 500ms aktualisiert):
-   - Viewport-Größe + 100dvh in px
-   - Drawer: open-State, Höhe, display, overflow, Schließen-Zustand
-   - drawer-body: scrollHeight / clientHeight / overflow-y
-   - document.body: scrollHeight / overflow / position (für iOS-Lock-Check)
-   - CSS-Version aus dem Link-Tag (bestätigt Cache-Busting)
-   - CSS-Custom-Property --bg-1 (bestätigt neue CSS geladen)
-────────────────────────────────────────────────────────────────── */
-const Debug = {
+const Debug = (() => {
+  let enabled = true;
+  let selectedMatchId = null;
+  let refreshTimer = null;
 
-  _hud:      null,
-  _interval: null,
-  _dvhEl:    null,
-  _tapCount: 0,
-  _tapTimer: null,
+  function el(id) {
+    return document.getElementById(id);
+  }
 
-  init() {
-    if (location.hash === '#debug') this.show();
-
-    // 10× Logo tippen aktiviert HUD
-    const logo = document.querySelector('.logo');
-    if (logo) {
-      logo.addEventListener('click', () => {
-        this._tapCount++;
-        clearTimeout(this._tapTimer);
-        this._tapTimer = setTimeout(() => { this._tapCount = 0; }, 2000);
-        if (this._tapCount >= 10) {
-          this._tapCount = 0;
-          this.toggle();
-        }
-      });
+  function safeJson(value) {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
     }
-  },
+  }
 
-  toggle() { this._hud ? this.hide() : this.show(); },
+  function short(v) {
+    if (v === null) return 'null';
+    if (v === undefined) return 'undefined';
+    if (Array.isArray(v)) return `Array(${v.length})`;
+    if (typeof v === 'object') return 'object';
+    return String(v);
+  }
 
-  show() {
-    if (this._hud) return;
+  function boolCls(v) {
+    return v ? 'dbg-ok' : 'dbg-bad';
+  }
 
-    const hud = document.createElement('div');
-    hud.id = 'debug-hud';
-    hud.style.cssText = [
-      'position:fixed', 'bottom:80px', 'right:10px',
-      'z-index:99999',
-      'background:rgba(0,0,0,0.92)',
-      'color:#c6f135',
-      'font-family:monospace', 'font-size:10px', 'line-height:1.7',
-      'padding:10px 12px', 'border-radius:8px',
-      'border:1px solid #c6f135',
-      'max-width:220px', 'word-break:break-all',
-      'pointer-events:all',
-    ].join(';');
+  function row(label, value, ok = null) {
+    const cls = ok === null ? 'dbg-neutral' : (ok ? 'dbg-ok' : 'dbg-bad');
+    return `
+      <div class="dbg-row">
+        <div class="dbg-k">${label}</div>
+        <div class="dbg-v ${cls}">${value}</div>
+      </div>
+    `;
+  }
 
-    const content = document.createElement('div');
-    const closeBtn = document.createElement('button');
-    closeBtn.textContent = '✕ schließen';
-    closeBtn.style.cssText = 'display:block;margin-top:8px;background:#c6f135;color:#000;border:none;border-radius:4px;padding:2px 8px;font-size:10px;cursor:pointer;width:100%';
-    closeBtn.onclick = () => this.hide();
+  function section(title, inner) {
+    return `
+      <div class="dbg-section">
+        <div class="dbg-title">${title}</div>
+        ${inner}
+      </div>
+    `;
+  }
 
-    hud.appendChild(content);
-    hud.appendChild(closeBtn);
-    document.body.appendChild(hud);
-    this._hud = hud;
-    this._content = content;
+  function findCurrentMatch() {
+    if (selectedMatchId && window.State?.allMatches) {
+      return State.allMatches.find(m => m.id === selectedMatchId) || null;
+    }
+    return null;
+  }
 
-    // Dummy-Element um 100dvh in px zu messen
-    this._dvhEl = document.createElement('div');
-    this._dvhEl.style.cssText = 'position:fixed;top:0;left:0;height:100dvh;width:0;pointer-events:none;z-index:-1;visibility:hidden';
-    document.body.appendChild(this._dvhEl);
+  function getDrawerState() {
+    const overlay = el('drawer-overlay');
+    const drawer = el('drawer');
+    const body = el('drawer-body');
 
-    this._update();
-    this._interval = setInterval(() => this._update(), 500);
-  },
+    return {
+      jsOpen: !!window.Drawer?._isOpen,
+      clsOpen: !!overlay?.classList.contains('open'),
+      overlayVisible: overlay ? getComputedStyle(overlay).visibility : 'n/a',
+      overlayPE: overlay ? getComputedStyle(overlay).pointerEvents : 'n/a',
+      drawerDisplay: drawer ? getComputedStyle(drawer).display : 'n/a',
+      drawerHeight: drawer ? `${Math.round(drawer.getBoundingClientRect().height)}px` : 'n/a',
+      bodyScrollH: body ? body.scrollHeight : 'n/a',
+      bodyClientH: body ? body.clientHeight : 'n/a',
+      bodyOverflowY: body ? getComputedStyle(body).overflowY : 'n/a',
+    };
+  }
 
-  hide() {
-    if (this._hud)   { this._hud.remove();   this._hud = null; }
-    if (this._dvhEl) { this._dvhEl.remove();  this._dvhEl = null; }
-    clearInterval(this._interval);
-    this._interval = null;
-  },
+  function inspectMatch(match) {
+    if (!match) {
+      return section('MATCH', row('selectedMatchId', short(selectedMatchId), false) +
+        row('match', 'nicht gefunden', false));
+    }
 
-  _update() {
-    if (!this._content) return;
+    const market = match.market || null;
+    const hasMarketObj = !!market;
+    const hasOddsStruct = !!market?.odds;
+    const hasOddsValues = (
+      market?.odds?.home != null &&
+      market?.odds?.draw != null &&
+      market?.odds?.away != null
+    );
 
-    const overlay    = document.getElementById('drawer-overlay');
-    const drawer     = document.getElementById('drawer');
-    const drawerBody = document.getElementById('drawer-body');
-    const cssLink    = document.querySelector('link[href*="main.css"]');
+    const models = window.ModelEngine?.run ? ModelEngine.run(match) : null;
+    const consensus = window.ModelEngine?.consensus ? ModelEngine.consensus(models) : null;
+    const mainModels = window.ModelEngine?.mainModels ? ModelEngine.mainModels(models) : null;
+    const aiAgent = window.ModelEngine?.agentResult ? ModelEngine.agentResult(models) : null;
 
-    // Viewport
-    const dvhPx = this._dvhEl ? this._dvhEl.offsetHeight : '?';
+    const marketSection = section('MARKET', [
+      row('market obj', short(market), hasMarketObj),
+      row('market.odds', short(market?.odds), hasOddsStruct),
+      row('odds.home', short(market?.odds?.home), market?.odds?.home != null),
+      row('odds.draw', short(market?.odds?.draw), market?.odds?.draw != null),
+      row('odds.away', short(market?.odds?.away), market?.odds?.away != null),
+      row('probs.home', short(market?.probs?.home), market?.probs?.home != null),
+      row('edge.home', short(market?.edge?.home), market?.edge?.home != null),
+      row('ev.home', short(market?.ev?.home), market?.ev?.home != null),
+      row('value.home', short(market?.value?.home), market?.value?.home !== undefined),
+      row('has odds values', String(hasOddsValues), hasOddsValues),
+    ].join(''));
 
-    // Drawer state (from Drawer._isOpen JS flag, not just CSS class)
-    const isOpenCls  = overlay?.classList.contains('open') ?? false;
-    const isOpenJS   = typeof Drawer !== 'undefined' ? Drawer._isOpen : '?';
-    const drawerRect = drawer?.getBoundingClientRect();
-    const drawerH    = drawerRect ? drawerRect.height.toFixed(0) : '–';
-    const drawerComp = drawer ? getComputedStyle(drawer).height : '–';
-    const drawerDisp = drawer ? getComputedStyle(drawer).display : '–';
-    const drawerOvf  = drawer ? getComputedStyle(drawer).overflow : '–';
-    const overlayPE  = overlay ? getComputedStyle(overlay).pointerEvents : '–';
-    const overlayVis = overlay ? getComputedStyle(overlay).visibility : '–';
+    const modelSection = section('MODELS', [
+      row('ModelEngine.run', short(models), Array.isArray(models)),
+      row('models.length', short(models?.length), Array.isArray(models)),
+      row('consensus', short(consensus), !!consensus),
+      row('consensus.label', short(consensus?.label ?? consensus?.name ?? consensus?.tip), !!(consensus?.label ?? consensus?.name ?? consensus?.tip)),
+      row('mainModels', short(mainModels), Array.isArray(mainModels)),
+      row('mainModels.length', short(mainModels?.length), Array.isArray(mainModels)),
+      row('first model', short(mainModels?.[0]?.name ?? mainModels?.[0]?.label ?? mainModels?.[0]?.model), !!mainModels?.[0]),
+      row('aiAgent', short(aiAgent), !!aiAgent),
+      row('aiAgent.text', short(aiAgent?.text ?? aiAgent?.note ?? aiAgent?.reason), !!(aiAgent?.text ?? aiAgent?.note ?? aiAgent?.reason)),
+    ].join(''));
 
-    // drawer-body
-    const dbScrollH  = drawerBody ? drawerBody.scrollHeight : '–';
-    const dbClientH  = drawerBody ? drawerBody.clientHeight : '–';
-    const dbOvfY     = drawerBody ? getComputedStyle(drawerBody).overflowY : '–';
+    const coreSection = section('MATCH', [
+      row('id', match.id, true),
+      row('homeTeam', short(match.homeTeam), !!match.homeTeam),
+      row('awayTeam', short(match.awayTeam), !!match.awayTeam),
+      row('competition', short(match.competitionName), !!match.competitionName),
+      row('kickoffAt', short(match.kickoffAt), !!match.kickoffAt),
+      row('winProbability', short(match.winProbability), match.winProbability != null),
+      row('drawProbability', short(match.drawProbability), match.drawProbability != null),
+      row('awayProbability', short(match.awayProbability), match.awayProbability != null),
+      row('confidenceScore', short(match.confidenceScore), match.confidenceScore != null),
+      row('predictedWinner', short(match.predictedWinner), !!match.predictedWinner),
+    ].join(''));
 
-    // document.body (iOS scroll-lock check)
-    const docBodyOvf = document.body.style.overflow || '(css)';
-    const docBodyPos = document.body.style.position || '(css)';
-    const docScrollH = document.documentElement.scrollHeight;
-    const docClientH = document.documentElement.clientHeight;
+    const rawDump = section('RAW MATCH OBJECT', `
+      <pre class="dbg-pre">${escapeHtml(safeJson(match))}</pre>
+    `);
 
-    // CSS
-    const cssHref = cssLink ? cssLink.href.split('/').pop() : '–';
-    const bg1     = getComputedStyle(document.documentElement)
-                      .getPropertyValue('--bg-1').trim() || '–';
+    return coreSection + marketSection + modelSection + rawDump;
+  }
 
-    // Search input state
-    const searchInput = document.getElementById('search-input');
-    const searchPE    = searchInput ? getComputedStyle(searchInput).pointerEvents : '–';
-    const searchVis   = searchInput ? getComputedStyle(searchInput).visibility : '–';
-    const searchDisp  = searchInput ? getComputedStyle(searchInput).display : '–';
+  function escapeHtml(str) {
+    return String(str)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;');
+  }
 
-    const row = (label, val, warn = false) =>
-      `<span style="color:${warn ? '#ff6b6b' : '#888'}">${label}:</span> <span style="color:${warn ? '#ff6b6b' : '#c6f135'}">${val}</span>`;
+  function render() {
+    if (!enabled) return;
 
-    this._content.innerHTML = `
-      <b style="color:#fff;font-size:11px">EuroMatch Debug</b><br>
-      <span style="color:#555">──────────────</span><br>
-      ${row('viewport', `${window.innerWidth}×${window.innerHeight}`)}<br>
-      ${row('100dvh', `${dvhPx}px`)}<br>
-      <span style="color:#555">── DRAWER ─────</span><br>
-      ${row('open (JS)', isOpenJS, isOpenJS !== isOpenCls)}<br>
-      ${row('open (cls)', isOpenCls)}<br>
-      ${row('height (rect)', `${drawerH}px`, drawerH < 100 && isOpenJS)}<br>
-      ${row('height (comp)', drawerComp)}<br>
-      ${row('display', drawerDisp)}<br>
-      ${row('overflow', drawerOvf)}<br>
-      ${row('overlay PE', overlayPE, overlayPE !== 'none' && !isOpenCls)}<br>
-      ${row('overlay vis', overlayVis, overlayVis === 'visible' && !isOpenCls)}<br>
-      <span style="color:#555">── DRAWER BODY ─</span><br>
-      ${row('scrollH', dbScrollH)}<br>
-      ${row('clientH', dbClientH)}<br>
-      ${row('ovf-y', dbOvfY)}<br>
-      <span style="color:#555">── DOC BODY ────</span><br>
-      ${row('body.ovf', docBodyOvf, docBodyOvf === 'hidden')}<br>
-      ${row('body.pos', docBodyPos, docBodyPos === 'fixed')}<br>
-      ${row('doc scrollH', docScrollH, docScrollH < 200)}<br>
-      ${row('doc clientH', docClientH)}<br>
-      <span style="color:#555">── SEARCH ──────</span><br>
-      ${row('pointerEvents', searchPE, searchPE === 'none')}<br>
-      ${row('visibility', searchVis, searchVis === 'hidden')}<br>
-      ${row('display', searchDisp, searchDisp === 'none')}<br>
-      <span style="color:#555">── CSS ─────────</span><br>
-      ${row('file', cssHref)}<br>
-      ${row('--bg-1', bg1)}
-    `.trim();
-  },
-};
+    const root = el('debug-dialog-body');
+    if (!root) return;
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => Debug.init());
-} else {
-  Debug.init();
-}
+    const drawer = getDrawerState();
+    const match = findCurrentMatch();
+
+    root.innerHTML =
+      section('DRAWER', [
+        row('open (JS)', String(drawer.jsOpen), drawer.jsOpen),
+        row('open (class)', String(drawer.clsOpen), drawer.clsOpen),
+        row('overlay visibility', drawer.overlayVisible, drawer.overlayVisible === 'visible'),
+        row('overlay pointerEvents', drawer.overlayPE, drawer.overlayPE !== 'none'),
+        row('drawer display', drawer.drawerDisplay, drawer.drawerDisplay !== 'none'),
+        row('drawer height', drawer.drawerHeight, true),
+        row('body scrollHeight', short(drawer.bodyScrollH), true),
+        row('body clientHeight', short(drawer.bodyClientH), true),
+        row('body overflowY', drawer.bodyOverflowY, true),
+      ].join('')) +
+      inspectMatch(match);
+  }
+
+  function ensureUI() {
+    if (el('debug-dialog')) return;
+
+    const html = `
+      <div id="debug-dialog" class="debug-dialog hidden">
+        <div class="debug-dialog-card">
+          <div class="debug-dialog-head">
+            <div class="debug-dialog-title">EuroMatch Live Debug</div>
+            <div class="debug-dialog-actions">
+              <button id="debug-refresh-btn" class="debug-btn">Refresh</button>
+              <button id="debug-close-btn" class="debug-btn debug-btn-close">×</button>
+            </div>
+          </div>
+          <div id="debug-dialog-body" class="debug-dialog-body"></div>
+        </div>
+      </div>
+      <button id="debug-fab" class="debug-fab">🐞</button>
+    `;
+
+    document.body.insertAdjacentHTML('beforeend', html);
+
+    el('debug-fab').addEventListener('click', open);
+    el('debug-close-btn').addEventListener('click', close);
+    el('debug-refresh-btn').addEventListener('click', render);
+    el('debug-dialog').addEventListener('click', (e) => {
+      if (e.target.id === 'debug-dialog') close();
+    });
+  }
+
+  function injectStyles() {
+    if (el('debug-dialog-styles')) return;
+    const css = `
+      <style id="debug-dialog-styles">
+        .debug-dialog.hidden { display:none; }
+        .debug-dialog {
+          position: fixed;
+          inset: 0;
+          z-index: 99999;
+          background: rgba(0,0,0,.65);
+          display: flex;
+          align-items: flex-end;
+          justify-content: center;
+          padding: 12px;
+        }
+        .debug-dialog-card {
+          width: min(920px, 100%);
+          max-height: 88vh;
+          background: #081308;
+          border: 1px solid rgba(198,241,53,.35);
+          border-radius: 18px;
+          overflow: hidden;
+          box-shadow: 0 20px 80px rgba(0,0,0,.45);
+        }
+        .debug-dialog-head {
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+          gap:10px;
+          padding:14px 16px;
+          border-bottom:1px solid rgba(255,255,255,.08);
+        }
+        .debug-dialog-title {
+          color:#fff;
+          font-weight:800;
+          font-size:18px;
+        }
+        .debug-dialog-actions {
+          display:flex;
+          gap:8px;
+        }
+        .debug-btn {
+          border:1px solid rgba(198,241,53,.35);
+          background:#162516;
+          color:#d8ff66;
+          border-radius:10px;
+          padding:8px 12px;
+          font-weight:700;
+        }
+        .debug-btn-close {
+          color:#fff;
+          min-width:42px;
+        }
+        .debug-dialog-body {
+          overflow:auto;
+          max-height: calc(88vh - 58px);
+          padding: 14px;
+        }
+        .dbg-section {
+          margin-bottom: 14px;
+          border: 1px solid rgba(255,255,255,.07);
+          border-radius: 14px;
+          padding: 12px;
+          background: rgba(255,255,255,.02);
+        }
+        .dbg-title {
+          color:#d8ff66;
+          font-weight:800;
+          margin-bottom:10px;
+          letter-spacing:.04em;
+          text-transform:uppercase;
+          font-size:12px;
+        }
+        .dbg-row {
+          display:grid;
+          grid-template-columns: 160px 1fr;
+          gap:10px;
+          padding:6px 0;
+          border-bottom:1px solid rgba(255,255,255,.04);
+        }
+        .dbg-row:last-child { border-bottom:none; }
+        .dbg-k { color:#9fb39f; font-size:13px; }
+        .dbg-v { font-size:13px; word-break:break-word; }
+        .dbg-ok { color:#bfff72; }
+        .dbg-bad { color:#ff7d7d; }
+        .dbg-neutral { color:#fff; }
+        .dbg-pre {
+          margin:0;
+          white-space:pre-wrap;
+          word-break:break-word;
+          color:#d9e7d9;
+          font-size:12px;
+          line-height:1.45;
+        }
+        .debug-fab {
+          position: fixed;
+          right: 14px;
+          bottom: 14px;
+          z-index: 99998;
+          width: 52px;
+          height: 52px;
+          border-radius: 50%;
+          border: 1px solid rgba(198,241,53,.35);
+          background: #1b2c12;
+          color: #d8ff66;
+          font-size: 24px;
+          box-shadow: 0 10px 30px rgba(0,0,0,.35);
+        }
+        @media (max-width: 640px) {
+          .dbg-row {
+            grid-template-columns: 1fr;
+            gap: 4px;
+          }
+        }
+      </style>
+    `;
+    document.head.insertAdjacentHTML('beforeend', css);
+  }
+
+  function open() {
+    ensureUI();
+    injectStyles();
+    el('debug-dialog').classList.remove('hidden');
+    render();
+
+    if (!refreshTimer) {
+      refreshTimer = setInterval(render, 1200);
+    }
+  }
+
+  function close() {
+    el('debug-dialog')?.classList.add('hidden');
+    if (refreshTimer) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+  }
+
+  function inspectMatchById(id) {
+    selectedMatchId = id;
+    if (!el('debug-dialog')) {
+      ensureUI();
+      injectStyles();
+    }
+    render();
+  }
+
+  function init() {
+    ensureUI();
+    injectStyles();
+  }
+
+  return {
+    init,
+    open,
+    close,
+    render,
+    inspectMatchById,
+  };
+})();
