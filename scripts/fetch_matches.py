@@ -7,6 +7,7 @@ Environment variables required:
   FOOTBALL_DATA_API_KEY      — football-data.org API key
   SUPABASE_URL               — https://<project>.supabase.co
   SUPABASE_SERVICE_ROLE_KEY  — Supabase service_role JWT
+  DATABASE_URL               — Postgres connection string
 
 Usage:
   python scripts/fetch_matches.py
@@ -20,12 +21,14 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Dict, List, Optional
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import requests
 
-from config import ACTIVE_SOURCE_CODES, COMPETITION_BY_SOURCE
 
 # ─────────────────────────────────────────────────────────────
 # LOGGING
@@ -37,6 +40,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
 
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -62,6 +66,64 @@ FORBIDDEN_MATCH_FIELDS = {
 
 
 # ─────────────────────────────────────────────────────────────
+# DB Competition Mapping
+# ─────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class CompetitionMapping:
+    source_code: str
+    competition_code: str
+    competition_name: str
+    competition_type: str
+    country: str
+    flag: Optional[str]
+    league_abbr: str
+
+
+def load_active_football_data_mappings(database_url: str) -> Dict[str, CompetitionMapping]:
+    """
+    Lädt aktive football_data-Mappings aus der DB.
+    Damit wird die DB zur operativen Source of Truth für Competitions.
+    """
+    sql = """
+        select
+          external_code as source_code,
+          competition_code,
+          competition_name,
+          competition_type,
+          country,
+          flag,
+          league_abbr
+        from public.v_competition_external_map_active
+        where source_system = 'football_data'
+        order by competition_code
+    """
+
+    conn = psycopg2.connect(database_url)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    result: Dict[str, CompetitionMapping] = {}
+    for row in rows:
+        result[row["source_code"]] = CompetitionMapping(
+            source_code=row["source_code"],
+            competition_code=row["competition_code"],
+            competition_name=row["competition_name"],
+            competition_type=row["competition_type"],
+            country=row["country"],
+            flag=row["flag"],
+            league_abbr=row["league_abbr"],
+        )
+
+    log.info("Loaded %d active football_data competition mappings from DB.", len(result))
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
 # FOOTBALL-DATA CLIENT
 # ─────────────────────────────────────────────────────────────
 
@@ -80,7 +142,7 @@ class FootballDataClient:
         source_code: str,
         date_from: str,
         date_to: str,
-    ) -> list[dict[str, Any]]:
+    ) -> List[Dict[str, Any]]:
         """
         Fetch matches for a single competition within a date range.
         Returns the raw list of match objects from the API.
@@ -116,7 +178,7 @@ class FootballDataClient:
 # MAPPER — football-data payload → Supabase `matches` row
 # ─────────────────────────────────────────────────────────────
 
-def map_match(raw: dict[str, Any], source_code: str) -> dict[str, Any] | None:
+def map_match(raw: Dict[str, Any], comp: CompetitionMapping) -> Optional[Dict[str, Any]]:
     """
     Map a single raw football-data match object to our Supabase `matches` schema.
     Returns None if the match should be skipped.
@@ -147,8 +209,6 @@ def map_match(raw: dict[str, Any], source_code: str) -> dict[str, Any] | None:
 
     home_source_id = home_team_raw.get("id")
     away_source_id = away_team_raw.get("id")
-
-    comp = COMPETITION_BY_SOURCE[source_code]
 
     row = {
         # ── Identifikation
@@ -220,7 +280,7 @@ class SupabaseClient:
             "Prefer": "resolution=merge-duplicates,return=minimal",
         })
 
-    def upsert(self, table: str, rows: list[dict[str, Any]]) -> None:
+    def upsert(self, table: str, rows: List[Dict[str, Any]]) -> None:
         """
         UPSERT rows into the given table on conflict key `external_id`.
 
@@ -279,16 +339,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_env() -> tuple[str, str, str]:
+def load_env() -> tuple[str, str, str, str]:
     api_key = os.environ.get("FOOTBALL_DATA_API_KEY", "").strip()
     supabase_url = os.environ.get("SUPABASE_URL", "").strip()
     service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    database_url = os.environ.get("DATABASE_URL", "").strip()
 
     missing = [
         name for name, val in [
             ("FOOTBALL_DATA_API_KEY", api_key),
             ("SUPABASE_URL", supabase_url),
             ("SUPABASE_SERVICE_ROLE_KEY", service_key),
+            ("DATABASE_URL", database_url),
         ]
         if not val
     ]
@@ -297,7 +359,7 @@ def load_env() -> tuple[str, str, str]:
         log.error("Missing required environment variables: %s", ", ".join(missing))
         sys.exit(1)
 
-    return api_key, supabase_url, service_key
+    return api_key, supabase_url, service_key, database_url
 
 
 # ─────────────────────────────────────────────────────────────
@@ -307,13 +369,17 @@ def load_env() -> tuple[str, str, str]:
 def run(date_from: str, date_to: str, dry_run: bool) -> None:
     log.info("═══════════════════════════════════════════════")
     log.info("EuroMatch Edge — fetch_matches.py")
-    log.info("FETCH_MATCHES_VERSION = no_market_odds_v3")
+    log.info("FETCH_MATCHES_VERSION = db_competition_registry_v1")
     log.info("Date range  : %s → %s", date_from, date_to)
-    log.info("Competitions: %d active", len(ACTIVE_SOURCE_CODES))
     log.info("Dry run     : %s", dry_run)
     log.info("═══════════════════════════════════════════════")
 
-    api_key, supabase_url, service_key = load_env()
+    api_key, supabase_url, service_key, database_url = load_env()
+
+    competition_map = load_active_football_data_mappings(database_url)
+    active_source_codes = sorted(competition_map.keys())
+
+    log.info("Competitions: %d active football_data mappings", len(active_source_codes))
 
     fd_client = FootballDataClient(api_key)
     sb_client = SupabaseClient(supabase_url, service_key) if not dry_run else None
@@ -322,12 +388,14 @@ def run(date_from: str, date_to: str, dry_run: bool) -> None:
     total_mapped = 0
     total_skipped = 0
     total_upserted = 0
-    succeeded_codes: list[str] = []
-    failed_codes: list[str] = []
-    errors: list[str] = []
+    succeeded_codes: List[str] = []
+    failed_codes: List[str] = []
+    errors: List[str] = []
 
-    for source_code in ACTIVE_SOURCE_CODES:
-        log.info("─── %s", source_code)
+    for source_code in active_source_codes:
+        comp = competition_map[source_code]
+
+        log.info("─── %s | %s", source_code, comp.competition_code)
 
         try:
             raw_matches = fd_client.get_matches(source_code, date_from, date_to)
@@ -349,9 +417,9 @@ def run(date_from: str, date_to: str, dry_run: bool) -> None:
 
         total_fetched += len(raw_matches)
 
-        rows: list[dict[str, Any]] = []
+        rows: List[Dict[str, Any]] = []
         for raw in raw_matches:
-            mapped = map_match(raw, source_code)
+            mapped = map_match(raw, comp)
             if mapped:
                 rows.append(mapped)
                 total_mapped += 1
@@ -382,7 +450,7 @@ def run(date_from: str, date_to: str, dry_run: bool) -> None:
 
     log.info("═══════════════════════════════════════════════")
     log.info("SUMMARY")
-    log.info("  Competitions : %d active", len(ACTIVE_SOURCE_CODES))
+    log.info("  Competitions : %d active", len(active_source_codes))
     log.info("  Succeeded    : %d  %s", len(succeeded_codes), succeeded_codes)
     log.info("  Failed       : %d  %s", len(failed_codes), failed_codes)
     log.info("  Fetched      : %d", total_fetched)

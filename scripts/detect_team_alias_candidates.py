@@ -1,13 +1,15 @@
-import os
+import json
 import logging
+import os
 import re
+import time
 import unicodedata
 from datetime import datetime
 from hashlib import sha256
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
-from psycopg2.extras import execute_values
+from psycopg2.extras import RealDictCursor, execute_values
 import requests
 
 
@@ -18,6 +20,10 @@ LOOKAHEAD_DAYS = int(os.getenv("ODDS_LOOKAHEAD_DAYS", "14"))
 ODDS_REGIONS = os.getenv("ODDS_REGIONS", "eu,uk")
 ODDS_MARKETS = os.getenv("ODDS_MARKETS", "h2h")
 REQUEST_TIMEOUT = int(os.getenv("ODDS_REQUEST_TIMEOUT", "30"))
+ODDS_SOURCE_SYSTEM = os.getenv("ODDS_SOURCE_SYSTEM", "odds_api")
+
+MAX_RETRIES = int(os.getenv("ODDS_MAX_RETRIES", "3"))
+INITIAL_BACKOFF_SECONDS = int(os.getenv("ODDS_INITIAL_BACKOFF_SECONDS", "2"))
 
 SPORTS_URL = "https://api.the-odds-api.com/v4/sports"
 ODDS_URL_TEMPLATE = "https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
@@ -30,34 +36,21 @@ logger = logging.getLogger("detect_team_alias_candidates")
 
 
 # -----------------------------------------------------------------------------
-# Normalisierung / Aliase
+# Technische Normalisierung
+# Fachliche Wahrheit liegt in der DB, nicht im Skript.
 # -----------------------------------------------------------------------------
 
-TEAM_ALIASES: Dict[str, List[str]] = {
-    "bayern munchen": ["bayern", "bayern munich"],
-    "atalanta": ["atalanta bc", "atalanta bergamasca calcio"],
-    "sporting": [
-        "sporting clube de portugal",
-        "sporting cp",
-        "sporting lisbon",
-        "sporting portugal",
-    ],
-    "bodo glimt": ["fk bodo glimt", "bodo glimt", "bodo/glimt"],
-    "paris saint germain": ["psg", "paris saint germain fc"],
-    "real madrid": ["real madrid cf"],
-    "barcelona": ["fc barcelona"],
-    "atletico madrid": ["club atletico de madrid", "atletico de madrid", "atletico madrid"],
-    "watford": ["watford fc"],
-    "wrexham": ["wrexham afc"],
-    "southampton": ["southampton fc"],
-    "norwich city": ["norwich city fc"],
-    "manchester city": ["manchester city fc"],
-    "chelsea": ["chelsea fc"],
-    "arsenal": ["arsenal fc"],
-    "newcastle united": ["newcastle united fc"],
-    "tottenham hotspur": ["tottenham hotspur fc", "spurs"],
-    "liverpool": ["liverpool fc"],
-    "galatasaray": ["galatasaray sk"],
+STOPWORDS = {
+    "fc", "sc", "sv", "ev", "afc", "bc", "cf",
+    "sk", "fk", "club", "clube",
+    "de", "da", "do", "del",
+}
+
+GENERIC_REPLACEMENTS = {
+    "ä": "ae",
+    "ö": "oe",
+    "ü": "ue",
+    "ß": "ss",
 }
 
 
@@ -66,87 +59,27 @@ def normalize_text(value: Optional[str]) -> str:
         return ""
 
     value = value.strip().lower()
-    value = (
-        value.replace("ä", "ae")
-        .replace("ö", "oe")
-        .replace("ü", "ue")
-        .replace("ß", "ss")
-    )
+    for src, dst in GENERIC_REPLACEMENTS.items():
+        value = value.replace(src, dst)
 
     value = unicodedata.normalize("NFKD", value)
     value = "".join(ch for ch in value if not unicodedata.combining(ch))
-    value = re.sub(r"[^a-z0-9 /-]+", " ", value)
+    value = value.replace("/", " ").replace("-", " ")
+    value = re.sub(r"[^a-z0-9 ]+", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
 
 
 def normalize_team_name(name: Optional[str]) -> str:
-    if not name:
+    norm = normalize_text(name)
+    if not norm:
         return ""
 
-    value = name.lower().strip()
+    parts = [p for p in norm.split() if p not in STOPWORDS]
+    norm = " ".join(parts)
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return norm
 
-    value = (
-        value.replace("ä", "ae")
-        .replace("ö", "oe")
-        .replace("ü", "ue")
-        .replace("ß", "ss")
-    )
-
-    value = unicodedata.normalize("NFKD", value)
-    value = "".join(c for c in value if not unicodedata.combining(c))
-
-    value = value.replace("/", " ")
-    value = value.replace("-", " ")
-    value = re.sub(r"[^a-z0-9 ]+", " ", value)
-
-    stopwords = {
-        "fc", "sc", "sv", "ev", "afc", "bc", "cf",
-        "sk", "fk", "club", "clube",
-        "de", "da", "do", "del"
-    }
-    parts = [p for p in value.split() if p not in stopwords]
-    value = " ".join(parts)
-
-    replacements = {
-        "munich": "munchen",
-        "muenchen": "munchen",
-        "bayern munich": "bayern munchen",
-        "atalanta bc": "atalanta",
-        "atalanta bergamasca calcio": "atalanta",
-        "sporting cp": "sporting",
-        "sporting lisbon": "sporting",
-        "sporting portugal": "sporting",
-        "bodoe": "bodo",
-        "bodo glimt": "bodo glimt",
-    }
-
-    for src, dst in replacements.items():
-        value = value.replace(src, dst)
-
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
-
-
-def team_name_candidates(name: Optional[str]) -> List[str]:
-    norm = normalize_team_name(name)
-    candidates = {norm}
-
-    if norm in TEAM_ALIASES:
-        candidates.update(normalize_team_name(x) for x in TEAM_ALIASES[norm])
-
-    for base, aliases in TEAM_ALIASES.items():
-        alias_norms = {normalize_team_name(a) for a in aliases}
-        if norm in alias_norms:
-            candidates.add(normalize_team_name(base))
-            candidates.update(alias_norms)
-
-    return [c for c in candidates if c]
-
-
-# -----------------------------------------------------------------------------
-# String-/Matching-Helfer
-# -----------------------------------------------------------------------------
 
 def parse_iso_ts(value: Optional[str]) -> Optional[datetime]:
     if not value:
@@ -162,9 +95,6 @@ def token_set(value: str) -> set[str]:
 
 
 def similarity_score(a: str, b: str) -> float:
-    """
-    Jaccard-ähnliches Token-Overlap.
-    """
     if not a or not b:
         return 0.0
 
@@ -188,8 +118,8 @@ def is_trivial_name_difference(a: str, b: str) -> bool:
     """
     Filtert kosmetische Unterschiede raus:
     - gleiche Normalform
-    - sehr hoher Token-Overlap
     - gleiche Tokenmenge
+    - sehr hoher Token-Overlap
     - Teilstring + hohe Überlappung
     """
     if not a or not b:
@@ -241,118 +171,70 @@ def build_dedup_key(
 
 
 # -----------------------------------------------------------------------------
-# Odds API Discovery
+# DB Lookups
 # -----------------------------------------------------------------------------
 
-def fetch_available_sports() -> List[Dict[str, Any]]:
-    response = requests.get(
-        SPORTS_URL,
-        params={"apiKey": ODDS_API_KEY},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    sports = response.json()
-    logger.info("Verfügbare Sports geladen: %s", len(sports))
-    return sports
+def load_active_odds_mappings(conn) -> Dict[str, Dict[str, Any]]:
+    sql = """
+        select
+          competition_code,
+          competition_name,
+          league_abbr,
+          competition_type,
+          country,
+          flag,
+          external_code as sport_key,
+          external_name
+        from public.v_competition_external_map_active
+        where source_system = %s
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, (ODDS_SOURCE_SYSTEM,))
+        rows = cur.fetchall()
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        result[row["competition_code"]] = dict(row)
+
+    logger.info("Aktive Odds-Competition-Mappings geladen: %s", len(result))
+    return result
 
 
-def build_sport_lookup(available_sports: List[Dict[str, Any]]) -> Dict[str, str]:
-    alias_to_key: Dict[str, str] = {}
+def load_active_team_aliases(conn) -> Dict[str, List[Dict[str, Any]]]:
+    sql = """
+        select
+          id,
+          source_system,
+          competition_code,
+          alias_name,
+          alias_normalized,
+          status,
+          confidence,
+          decision_source,
+          explanation,
+          team_id,
+          canonical_name,
+          canonical_normalized_name
+        from public.v_team_aliases_active
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
 
-    for sport in available_sports:
-        key = sport.get("key")
-        title = sport.get("title")
-        group = sport.get("group")
-        active = sport.get("active", True)
+    by_alias: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        by_alias.setdefault(row["alias_normalized"], []).append(dict(row))
 
-        if not key or not title or not active:
-            continue
-
-        group_norm = normalize_text(group)
-        title_norm = normalize_text(title)
-        key_norm = normalize_text(key)
-
-        if "soccer" not in group_norm and "soccer" not in key_norm:
-            continue
-
-        aliases = {title_norm, key_norm}
-
-        if "bundesliga" in title_norm or "bundesliga" in key_norm:
-            aliases.update({"bundesliga", "germany bundesliga"})
-        if "premier league" in title_norm or key == "soccer_epl":
-            aliases.update({"premier league", "epl", "england premier league"})
-        if "la liga" in title_norm:
-            aliases.update({"la liga", "spain la liga", "spanien la liga"})
-        if "serie a" in title_norm:
-            aliases.update({"serie a", "italy serie a", "italien serie a"})
-        if "ligue 1" in title_norm:
-            aliases.update({"ligue 1", "france ligue 1", "frankreich ligue 1"})
-        if "eredivisie" in title_norm:
-            aliases.update({"eredivisie", "niederlande eredivisie", "netherlands eredivisie"})
-        if "primeira liga" in title_norm:
-            aliases.update({"primeira liga", "portugal primeira liga"})
-        if "champions league" in title_norm:
-            aliases.update({"champions league", "uefa champions league"})
-        if "championship" in title_norm:
-            aliases.update({"championship", "efl championship", "english championship"})
-
-        for alias in aliases:
-            alias_to_key[alias] = key
-
-    logger.info("Soccer-Sport-Lookup gebaut: %s Einträge", len(alias_to_key))
-    return alias_to_key
+    logger.info("Aktive Team-Aliase geladen: %s Alias-Normalformen", len(by_alias))
+    return by_alias
 
 
-def resolve_sport_key(
-    competition_code: str,
-    competition_name: str,
-    country: Optional[str],
-    sport_lookup: Dict[str, str],
-) -> Optional[str]:
-    code_norm = normalize_text(competition_code)
-    name_norm = normalize_text(competition_name)
-    country_norm = normalize_text(country)
-
-    wanted_aliases = []
-
-    if code_norm == "bundesliga":
-        wanted_aliases += ["bundesliga", "germany bundesliga"]
-    elif code_norm == "premier_league":
-        wanted_aliases += ["premier league", "epl", "england premier league"]
-    elif code_norm == "la_liga":
-        wanted_aliases += ["la liga", "spain la liga", "spanien la liga"]
-    elif code_norm == "serie_a":
-        wanted_aliases += ["serie a", "italy serie a", "italien serie a"]
-    elif code_norm == "ligue_1":
-        wanted_aliases += ["ligue 1", "france ligue 1", "frankreich ligue 1"]
-    elif code_norm == "eredivisie":
-        wanted_aliases += ["eredivisie", "netherlands eredivisie", "niederlande eredivisie"]
-    elif code_norm == "primeira_liga":
-        wanted_aliases += ["primeira liga", "portugal primeira liga"]
-    elif code_norm == "champions_league":
-        wanted_aliases += ["champions league", "uefa champions league"]
-    elif code_norm == "championship":
-        wanted_aliases += ["championship", "efl championship", "english championship"]
-
-    wanted_aliases += [name_norm, f"{country_norm} {name_norm}".strip(), code_norm]
-
-    for alias in wanted_aliases:
-        if alias in sport_lookup:
-            return sport_lookup[alias]
-
-    return None
-
-
-# -----------------------------------------------------------------------------
-# DB
-# -----------------------------------------------------------------------------
-
-def get_upcoming_matches(conn, sport_lookup: Dict[str, str]) -> List[Dict[str, Any]]:
-    with conn.cursor() as cur:
+def get_upcoming_matches(conn, competition_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
             select
-              id,
+              id as match_id,
               kickoff_at,
               competition_code,
               competition_name,
@@ -368,65 +250,193 @@ def get_upcoming_matches(conn, sport_lookup: Dict[str, str]) -> List[Dict[str, A
         )
         rows = cur.fetchall()
 
-    matches = []
+    matches: List[Dict[str, Any]] = []
+    unresolved: List[Dict[str, Any]] = []
+
     for row in rows:
-        sport_key = resolve_sport_key(
-            competition_code=row[2],
-            competition_name=row[3],
-            country=row[4],
-            sport_lookup=sport_lookup,
-        )
-        if not sport_key:
+        comp = competition_map.get(row["competition_code"])
+        if not comp:
+            unresolved.append(
+                {
+                    "competition_code": row["competition_code"],
+                    "competition_name": row["competition_name"],
+                    "country": row["country"],
+                }
+            )
             continue
 
-        matches.append({
-            "match_id": row[0],
-            "kickoff_at": row[1],
-            "competition_code": row[2],
-            "competition_name": row[3],
-            "country": row[4],
-            "home_team": row[5],
-            "away_team": row[6],
-            "sport_key": sport_key,
-        })
+        item = dict(row)
+        item["sport_key"] = comp["sport_key"]
+        matches.append(item)
+
+    if unresolved:
+        logger.warning("Keine aktiven Odds-Mappings für folgende Competitions:")
+        seen = set()
+        for item in unresolved:
+            key = (item["competition_code"], item["competition_name"], item["country"])
+            if key in seen:
+                continue
+            seen.add(key)
+            logger.warning(
+                "  %s | %s | %s",
+                item["competition_code"],
+                item["competition_name"],
+                item["country"],
+            )
 
     logger.info("Relevante Matches im Lookahead: %s", len(matches))
     return matches
 
 
 # -----------------------------------------------------------------------------
-# Odds-Daten abrufen
+# Odds API
 # -----------------------------------------------------------------------------
 
-def fetch_odds_for_sport(sport_key: str) -> List[Dict[str, Any]]:
-    response = requests.get(
-        ODDS_URL_TEMPLATE.format(sport_key=sport_key),
-        params={
-            "apiKey": ODDS_API_KEY,
-            "regions": ODDS_REGIONS,
-            "markets": ODDS_MARKETS,
-            "oddsFormat": "decimal",
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
+def fetch_available_sports() -> List[Dict[str, Any]]:
+    params = {"apiKey": ODDS_API_KEY}
+    response = requests.get(SPORTS_URL, params=params, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
-    events = response.json()
-    logger.info("sport_key=%s | API events=%s", sport_key, len(events))
-    return events
+
+    sports = response.json()
+    logger.info("Verfügbare Sports geladen: %s", len(sports))
+    return sports
+
+
+def fetch_odds_for_sport(sport_key: str, max_retries: int = MAX_RETRIES) -> List[Dict[str, Any]]:
+    backoff = INITIAL_BACKOFF_SECONDS
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(
+                ODDS_URL_TEMPLATE.format(sport_key=sport_key),
+                params={
+                    "apiKey": ODDS_API_KEY,
+                    "regions": ODDS_REGIONS,
+                    "markets": ODDS_MARKETS,
+                    "oddsFormat": "decimal",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            used = response.headers.get("x-requests-used")
+            remaining = response.headers.get("x-requests-remaining")
+            if used or remaining:
+                logger.info("Odds API Credits | used=%s remaining=%s", used, remaining)
+
+            if response.status_code == 429:
+                logger.warning(
+                    "429 Rate Limit | sport_key=%s | attempt=%s/%s | wait=%ss",
+                    sport_key, attempt, max_retries, backoff,
+                )
+                if attempt < max_retries:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+
+                logger.error("429 bleibt bestehen → skip sport_key=%s", sport_key)
+                return []
+
+            response.raise_for_status()
+            events = response.json()
+            logger.info("sport_key=%s | API events=%s", sport_key, len(events))
+            return events
+
+        except requests.RequestException as exc:
+            logger.warning(
+                "Request Fehler | sport_key=%s | attempt=%s/%s | error=%s",
+                sport_key, attempt, max_retries, exc,
+            )
+            if attempt < max_retries:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+
+            logger.error("Request endgültig fehlgeschlagen → skip sport_key=%s", sport_key)
+            return []
+
+    return []
 
 
 # -----------------------------------------------------------------------------
-# Kandidatensuche
+# Kandidatensuche mit DB-Aliaswissen
 # -----------------------------------------------------------------------------
 
-def find_best_candidate(match: Dict[str, Any], events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def build_db_candidate_set(
+    team_name: str,
+    competition_code: str,
+    alias_lookup: Dict[str, List[Dict[str, Any]]],
+) -> set[str]:
+    """
+    Kandidaten für DB-Teamnamen:
+    - technische Normalform
+    - bekannte Alias-/Kanonikformen aus der DB
+    """
+    base_norm = normalize_team_name(team_name)
+    candidates = {base_norm}
+
+    alias_rows = alias_lookup.get(base_norm, [])
+    for row in alias_rows:
+        row_source = row.get("source_system")
+        row_comp = row.get("competition_code")
+
+        source_ok = row_source is None or row_source == ODDS_SOURCE_SYSTEM
+        comp_ok = row_comp is None or row_comp == competition_code
+
+        if source_ok and comp_ok:
+            candidates.add(row["alias_normalized"])
+            candidates.add(row["canonical_normalized_name"])
+
+    return {c for c in candidates if c}
+
+
+def build_api_candidate_set(
+    api_name: str,
+    competition_code: str,
+    alias_lookup: Dict[str, List[Dict[str, Any]]],
+) -> set[str]:
+    """
+    Kandidaten für API-Teamnamen:
+    - technische Normalform
+    - falls bereits bekannter Alias/Kanonik, auch kanonische DB-Form
+    """
+    base_norm = normalize_team_name(api_name)
+    candidates = {base_norm}
+
+    alias_rows = alias_lookup.get(base_norm, [])
+    for row in alias_rows:
+        row_source = row.get("source_system")
+        row_comp = row.get("competition_code")
+
+        source_ok = row_source is None or row_source == ODDS_SOURCE_SYSTEM
+        comp_ok = row_comp is None or row_comp == competition_code
+
+        if source_ok and comp_ok:
+            candidates.add(row["alias_normalized"])
+            candidates.add(row["canonical_normalized_name"])
+
+    return {c for c in candidates if c}
+
+
+def find_best_candidate(
+    match: Dict[str, Any],
+    events: List[Dict[str, Any]],
+    alias_lookup: Dict[str, List[Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
     db_home_norm = normalize_team_name(match["home_team"])
     db_away_norm = normalize_team_name(match["away_team"])
 
-    db_home_candidates = set(team_name_candidates(match["home_team"]))
-    db_away_candidates = set(team_name_candidates(match["away_team"]))
+    db_home_candidates = build_db_candidate_set(
+        team_name=match["home_team"],
+        competition_code=match["competition_code"],
+        alias_lookup=alias_lookup,
+    )
+    db_away_candidates = build_db_candidate_set(
+        team_name=match["away_team"],
+        competition_code=match["competition_code"],
+        alias_lookup=alias_lookup,
+    )
 
-    best = None
+    best: Optional[Dict[str, Any]] = None
     best_score = -1.0
 
     for event in events:
@@ -438,14 +448,33 @@ def find_best_candidate(match: Dict[str, Any], events: List[Dict[str, Any]]) -> 
         if not kickoff_close(match["kickoff_at"], event.get("commence_time")):
             continue
 
-        home_score = max(
-            [similarity_score(c, api_home_norm) for c in db_home_candidates] +
-            [similarity_score(db_home_norm, api_home_norm)]
+        api_home_candidates = build_api_candidate_set(
+            api_name=str(api_home or ""),
+            competition_code=match["competition_code"],
+            alias_lookup=alias_lookup,
         )
-        away_score = max(
-            [similarity_score(c, api_away_norm) for c in db_away_candidates] +
-            [similarity_score(db_away_norm, api_away_norm)]
+        api_away_candidates = build_api_candidate_set(
+            api_name=str(api_away or ""),
+            competition_code=match["competition_code"],
+            alias_lookup=alias_lookup,
         )
+
+        home_score = 0.0
+        away_score = 0.0
+
+        if db_home_candidates & api_home_candidates:
+            home_score = 1.0
+        else:
+            home_score = max(
+                [similarity_score(db_home_norm, c) for c in api_home_candidates] or [0.0]
+            )
+
+        if db_away_candidates & api_away_candidates:
+            away_score = 1.0
+        else:
+            away_score = max(
+                [similarity_score(db_away_norm, c) for c in api_away_candidates] or [0.0]
+            )
 
         total_score = round((home_score + away_score) / 2.0, 4)
 
@@ -477,7 +506,6 @@ def should_store_candidate(
     if not api_home_norm or not api_away_norm:
         return False
 
-    # Exakter oder trivialer Unterschied -> nicht speichern
     if db_home_norm == api_home_norm and db_away_norm == api_away_norm:
         return False
 
@@ -487,11 +515,9 @@ def should_store_candidate(
     ):
         return False
 
-    # Sehr hoher Score -> meist nur kosmetischer Unterschied
     if candidate_score >= 0.95:
         return False
 
-    # Sehr schwache Kandidaten ignorieren
     if candidate_score < 0.35:
         return False
 
@@ -499,7 +525,7 @@ def should_store_candidate(
 
 
 # -----------------------------------------------------------------------------
-# Insert
+# Inserts
 # -----------------------------------------------------------------------------
 
 def insert_candidates(conn, rows: List[Tuple[Any, ...]]) -> int:
@@ -539,6 +565,80 @@ def insert_candidates(conn, rows: List[Tuple[Any, ...]]) -> int:
     return len(rows)
 
 
+def insert_team_alias_events(conn, rows: List[Tuple[Any, ...]]) -> int:
+    if not rows:
+        return 0
+
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            insert into public.team_alias_events (
+              source_system,
+              competition_code,
+              raw_name,
+              raw_name_normalized,
+              home_or_away,
+              context,
+              status
+            ) values %s
+            """,
+            rows,
+            page_size=500,
+        )
+
+    return len(rows)
+
+
+def build_alias_event_rows_from_candidate(
+    match: Dict[str, Any],
+    best: Dict[str, Any],
+    alias_lookup: Dict[str, List[Dict[str, Any]]],
+) -> List[Tuple[Any, ...]]:
+    rows: List[Tuple[Any, ...]] = []
+
+    for side, raw_name in (
+        ("home", best.get("api_home_team")),
+        ("away", best.get("api_away_team")),
+    ):
+        raw_norm = normalize_team_name(raw_name)
+        if not raw_norm:
+            continue
+
+        if raw_norm in alias_lookup:
+            continue
+
+        context = {
+            "match_id": str(match["match_id"]),
+            "db_home_team": match["home_team"],
+            "db_away_team": match["away_team"],
+            "api_home_team": best.get("api_home_team"),
+            "api_away_team": best.get("api_away_team"),
+            "api_commence_time": best.get("api_commence_time").isoformat() if best.get("api_commence_time") else None,
+            "candidate_score": best.get("candidate_score"),
+            "sport_key": match["sport_key"],
+        }
+
+        rows.append(
+            (
+                ODDS_SOURCE_SYSTEM,
+                match["competition_code"],
+                raw_name,
+                raw_norm,
+                side,
+                json.dumps(context, ensure_ascii=False),
+                "new",
+            )
+        )
+
+    dedup = {}
+    for row in rows:
+        key = (row[0], row[1], row[3], row[4])
+        dedup[key] = row
+
+    return list(dedup.values())
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -549,8 +649,11 @@ def main() -> None:
 
     try:
         sports = fetch_available_sports()
-        sport_lookup = build_sport_lookup(sports)
-        matches = get_upcoming_matches(conn, sport_lookup)
+        active_sport_keys = {s.get("key") for s in sports if s.get("active", True)}
+
+        competition_map = load_active_odds_mappings(conn)
+        alias_lookup = load_active_team_aliases(conn)
+        matches = get_upcoming_matches(conn, competition_map)
 
         if not matches:
             logger.info("Keine relevanten Matches gefunden.")
@@ -558,16 +661,28 @@ def main() -> None:
 
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for match in matches:
+            if match["sport_key"] not in active_sport_keys:
+                logger.warning(
+                    "Sport-Key nicht aktiv/verfügbar laut Odds API: %s | competition=%s",
+                    match["sport_key"],
+                    match["competition_code"],
+                )
+                continue
             grouped.setdefault(match["sport_key"], []).append(match)
 
         candidate_rows: List[Tuple[Any, ...]] = []
+        alias_event_rows: List[Tuple[Any, ...]] = []
 
         for sport_key, sport_matches in grouped.items():
             logger.info("Prüfe sport_key=%s | matches=%s", sport_key, len(sport_matches))
             events = fetch_odds_for_sport(sport_key)
 
+            if not events:
+                logger.warning("Keine API-Events für sport_key=%s", sport_key)
+                continue
+
             for match in sport_matches:
-                best = find_best_candidate(match, events)
+                best = find_best_candidate(match, events, alias_lookup)
                 if not best:
                     continue
 
@@ -616,10 +731,20 @@ def main() -> None:
                     dedup_key,
                 ))
 
+                alias_event_rows.extend(
+                    build_alias_event_rows_from_candidate(
+                        match=match,
+                        best=best,
+                        alias_lookup=alias_lookup,
+                    )
+                )
+
         inserted = insert_candidates(conn, candidate_rows)
+        inserted_events = insert_team_alias_events(conn, alias_event_rows)
         conn.commit()
 
         logger.info("Alias-Kandidaten eingefügt: %s", inserted)
+        logger.info("team_alias_events eingefügt: %s", inserted_events)
 
     except Exception:
         conn.rollback()
