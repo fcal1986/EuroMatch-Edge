@@ -1,34 +1,76 @@
 name: Odds Pipeline
 
 on:
-  schedule:
-    - cron: "0 8,18 * * *"
   workflow_dispatch:
 
+  schedule:
+    - cron: "*/15 * * * *"   # alle 15 Minuten (anpassen je nach API Limits)
+
 jobs:
-  fetch-odds:
+  odds:
+    name: Fetch Odds & Resolve Aliases
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "scripts/requirements.txt"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-        
+        run: |
+          pip install -r scripts/requirements.txt
+
+      # ─────────────────────────────────────────
+      # 1. Odds holen
+      # ─────────────────────────────────────────
+      - name: Fetch odds
+        working-directory: scripts
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          echo "── fetch_odds.py"
+          python fetch_odds.py
+
+      # ─────────────────────────────────────────
+      # 2. Team Alias Auto-Resolver
+      # ─────────────────────────────────────────
       - name: Auto resolve team alias events
         working-directory: scripts
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/auto_resolve_team_alias_events.py
-        
-      - name: Fetch odds
-        run: python scripts/fetch_odds.py
+        run: |
+          echo "── auto_resolve_team_alias_events.py"
+          python auto_resolve_team_alias_events.py
+
+      # ─────────────────────────────────────────
+      # OPTIONAL (empfohlen): nochmal Odds laufen lassen
+      # damit neu gemappte Teams sofort genutzt werden
+      # ─────────────────────────────────────────
+      - name: Fetch odds (2nd pass)
+        working-directory: scripts
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          echo "── fetch_odds.py (second pass)"
+          python fetch_odds.py
+
+      # ─────────────────────────────────────────
+      # SUMMARY
+      # ─────────────────────────────────────────
+      - name: Pipeline summary
+        if: always()
+        run: |
+          echo "══════════════════════════════════════"
+          echo "Odds Pipeline finished"
+          echo "  Run ID  : ${{ github.run_id }}"
+          echo "  Status  : ${{ job.status }}"
+          echo "══════════════════════════════════════"
