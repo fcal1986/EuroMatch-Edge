@@ -33,6 +33,9 @@ INITIAL_BACKOFF_SECONDS = int(os.getenv("ODDS_INITIAL_BACKOFF_SECONDS", "2"))
 SPORTS_URL = "https://api.the-odds-api.com/v4/sports"
 ODDS_URL_TEMPLATE = "https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
 
+# Mindestquote für gültige Decimal Odds
+MIN_VALID_ODDS = float(os.getenv("MIN_VALID_ODDS", "1.01"))
+
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -103,6 +106,15 @@ def parse_iso_ts(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def is_valid_odds(value: Optional[float]) -> bool:
+    try:
+        if value is None:
+            return False
+        return float(value) > MIN_VALID_ODDS
+    except (TypeError, ValueError):
+        return False
+
+
 # -----------------------------------------------------------------------------
 # DB: Competition- und Alias-Lookups
 # -----------------------------------------------------------------------------
@@ -150,23 +162,6 @@ def load_active_odds_mappings(conn) -> Dict[str, Dict[str, Any]]:
 def load_active_team_aliases(conn) -> Dict[str, List[Dict[str, Any]]]:
     """
     Lädt alle aktiven Team-Aliase aus der DB.
-
-    Rückgabe:
-      {
-        "napoli": [
-          {
-            "team_id": 123,
-            "canonical_name": "SSC Napoli",
-            "canonical_normalized_name": "napoli",
-            "source_system": null,
-            "competition_code": null,
-            "alias_name": "Napoli",
-            "alias_normalized": "napoli",
-            ...
-          },
-          ...
-        ]
-      }
     """
     sql = """
         select
@@ -345,12 +340,6 @@ def build_match_candidate_set(
     alias_lookup: Dict[str, List[Dict[str, Any]]],
     source_system: str = ODDS_SOURCE_SYSTEM,
 ) -> List[str]:
-    """
-    Liefert alle für dieses Match gültigen Kandidaten:
-    - technische Normalform des DB-Namens
-    - kanonischer Name aus DB
-    - aktive Aliase aus DB (global / source / competition / source+competition)
-    """
     base_norm = normalize_team_name(team_name)
     candidates = {base_norm}
 
@@ -375,12 +364,6 @@ def build_event_candidate_set(
     alias_lookup: Dict[str, List[Dict[str, Any]]],
     source_system: str = ODDS_SOURCE_SYSTEM,
 ) -> List[str]:
-    """
-    Für API-Teamnamen:
-    - technische Normalform des API-Namens
-    - falls dieser Name schon als Alias bekannt ist, auch kanonische DB-Normalform
-    - falls dieser Name schon kanonischer DB-Name ist, ebenso
-    """
     base_norm = normalize_team_name(api_team_name)
     candidates = {base_norm}
 
@@ -419,7 +402,6 @@ def find_matching_event(
         )
     )
 
-    # 1) saubere Kandidatenlogik auf Alias-/Kanonik-Ebene
     for event in events:
         event_home_candidates = set(
             build_event_candidate_set(
@@ -440,7 +422,6 @@ def find_matching_event(
             if kickoff_close(match["kickoff_at"], event.get("commence_time")):
                 return event
 
-    # 2) Fallback technisch-normalisiert
     db_home_norm = normalize_team_name(match["home_team"])
     db_away_norm = normalize_team_name(match["away_team"])
 
@@ -488,10 +469,6 @@ def build_alias_event_rows_for_unmatched(
     events: List[Dict[str, Any]],
     alias_lookup: Dict[str, List[Dict[str, Any]]],
 ) -> List[Tuple[Any, ...]]:
-    """
-    Schreibt unbekannte API-Teams als Events.
-    Nur wenn die API-Normalform aktuell weder als Alias noch als kanonische Form bekannt ist.
-    """
     rows: List[Tuple[Any, ...]] = []
 
     known_alias_norms = set(alias_lookup.keys())
@@ -527,7 +504,6 @@ def build_alias_event_rows_for_unmatched(
                 )
             )
 
-    # Deduplicate innerhalb des Laufs
     dedup = {}
     for row in rows:
         key = (row[0], row[1], row[3], row[4])
@@ -689,7 +665,11 @@ def extract_snapshot_rows(
                     elif name.lower() == "draw":
                         draw_odds = price_val
 
-            if home_odds and draw_odds and away_odds:
+            valid_home = is_valid_odds(home_odds)
+            valid_draw = is_valid_odds(draw_odds)
+            valid_away = is_valid_odds(away_odds)
+
+            if valid_home and valid_draw and valid_away:
                 rows.append(
                     (
                         match["id"],
@@ -700,14 +680,24 @@ def extract_snapshot_rows(
                         "ft",
                         snapshot_ts,
                         parse_iso_ts(bookmaker.get("last_update")),
-                        home_odds,
-                        draw_odds,
-                        away_odds,
+                        float(home_odds),
+                        float(draw_odds),
+                        float(away_odds),
                         json.dumps(bookmaker, ensure_ascii=False),
                     )
                 )
+            else:
+                if any(v is not None for v in (home_odds, draw_odds, away_odds)):
+                    logger.warning(
+                        "Ungültige Odds verworfen | bookmaker=%s | match=%s vs %s | home=%s draw=%s away=%s",
+                        bookmaker.get("title"),
+                        match["home_team"],
+                        match["away_team"],
+                        home_odds,
+                        draw_odds,
+                        away_odds,
+                    )
 
-    # Alias-Events deduplizieren
     dedup = {}
     for row in alias_event_rows:
         key = (row[0], row[1], row[3], row[4])
